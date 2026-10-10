@@ -33,6 +33,16 @@ Lodestone is layer 0 of a three-layer pyramid. Dependencies point down only: a l
 - **Endpoints and site** (`endpoints`, `site`, `config_mask`): every service address comes from configuration, an
   environment variable, or a localhost default; the time zone likewise; secrets are masked before configuration is shown.
 
+## Gateway
+
+`python -m lodestone.gateway` puts one OpenAI-compatible address in front of your engines, so an app needs one base URL
+and one key instead of one port per model. It serves `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+`/v1/audio/transcriptions` and `/v1/audio/speech`, plus `/v1/models` and `/health`. A request is routed by its `model`
+(a role alias such as `coordinator`, `worker` or `vision`, or a model id), and streamed replies are relayed chunk by
+chunk. Configuration lives under `gateway` in `config.json`: `gateway.host` (default `127.0.0.1`), `gateway.port`
+(default `8000`) and `gateway.api_key`, or the `LODESTONE_API_KEY` environment variable, which turns on
+`Authorization: Bearer` checking. Binding beyond loopback without a key logs a warning.
+
 ## Install
 
 ```
