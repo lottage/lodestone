@@ -1,0 +1,9 @@
+# Files that run on the Linux hosts keep LF line endings even on this Windows checkout (core.autocrlf = true).
+# A CR at the end of a shell line or a unit value breaks it silently: 2026-09-28 the tryout slot exited 127
+# because BIN ended in CR; earlier the watch deploy's secrets file corrupted every token the same way.
+*.sh        text eol=lf
+*.service   text eol=lf
+*.timer     text eol=lf
+*.conf      text eol=lf
+*.env       text eol=lf
+*.env.example text eol=lf

@@ -1,0 +1,73 @@
+"""lodestone/endpoints.py: every service address from config, env, or a localhost default (docs/LAYERS.md M2)."""
+
+import os
+import sys
+import unittest
+from unittest import mock
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "StoneSage", "backend"))
+
+from lodestone import endpoints  # noqa: E402
+
+CFG = {"cluster": {"coordinator_url": "http://10.0.0.5:8001/v1/", "valkey_host": "10.0.0.5", "ssh_user": "ops"},
+       "qdrant": {"url": "http://10.0.0.9:6333"}, "voice": {"host": "10.0.0.7"},
+       "proxmox": {"host": "10.0.0.2"}}
+
+
+class TestEndpoints(unittest.TestCase):
+    def setUp(self):
+        env = {k: v for k, v in os.environ.items() if k not in {s[1] for s in endpoints.SERVICES.values()}}
+        self.env = mock.patch.dict(os.environ, env, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_config_wins_and_is_trimmed(self):
+        self.assertEqual(endpoints.url("coordinator", CFG), "http://10.0.0.5:8001/v1")
+        self.assertEqual(endpoints.host("coordinator", CFG), "10.0.0.5")
+
+    def test_second_path_is_read(self):
+        self.assertEqual(endpoints.url("qdrant", CFG), "http://10.0.0.9:6333")        # qdrant.url, no cluster.qdrant_url
+        both = {"cluster": {"qdrant_url": "http://a:1"}, "qdrant": {"url": "http://b:2"}}
+        self.assertEqual(endpoints.url("qdrant", both), "http://a:1")                 # first path first
+
+    def test_bare_host_borrows_scheme_and_port(self):
+        self.assertEqual(endpoints.url("valkey", CFG), "redis://10.0.0.5:6379")
+        self.assertEqual((endpoints.host("valkey", CFG), endpoints.port("valkey", CFG)), ("10.0.0.5", 6379))
+        self.assertEqual(endpoints.url("voice_legacy", CFG), "http://10.0.0.7")
+        self.assertEqual(endpoints.url("proxmox", CFG), "https://10.0.0.2:8006")
+
+    def test_env_then_default(self):
+        self.assertEqual(endpoints.url("worker", {}), "http://127.0.0.1:8002/v1")
+        with mock.patch.dict(os.environ, {"WORKER_URL": "http://w:9/v1"}):
+            self.assertEqual(endpoints.url("worker", {}), "http://w:9/v1")
+            self.assertEqual(endpoints.url("worker", {"cluster": {"worker_url": "http://c:1/v1"}}), "http://c:1/v1")
+
+    def test_optional_service_is_empty(self):
+        self.assertEqual(endpoints.url("immich", {}), "")
+        self.assertEqual(endpoints.host("immich", {}), "")
+
+    def test_missing_lists_defaults_only(self):
+        gone = endpoints.missing(CFG)
+        self.assertIn("worker", gone)
+        self.assertNotIn("coordinator", gone)
+        self.assertNotIn("immich", gone)                                              # optional: no default to fall to
+
+    def test_no_lan_address_in_defaults(self):
+        for name, (_, _, default) in endpoints.SERVICES.items():
+            self.assertNotRegex(default, r"192\.168\.|10\.\d+\.|172\.(1[6-9]|2\d|3[01])\.", name)
+
+    def test_ssh(self):
+        self.assertEqual(endpoints.ssh_target(CFG), "ops@10.0.0.5")
+        cmd = endpoints.ssh_cmd(CFG, "uptime", connect_timeout=5)
+        self.assertEqual(cmd[0], "ssh")
+        self.assertIn("StrictHostKeyChecking=accept-new", cmd)
+        self.assertIn("ConnectTimeout=5", cmd)
+        self.assertEqual(cmd[-2:], ["ops@10.0.0.5", "uptime"])
+        lab = dict(CFG, ssh={"host_key_checking": "no"})
+        self.assertIn("StrictHostKeyChecking=no", endpoints.ssh_cmd(lab, "x", target="root@h", no_stdin=True))
+        self.assertEqual(endpoints.ssh_cmd(lab, "x", target="root@h", no_stdin=True)[1], "-n")
+
+
+if __name__ == "__main__":
+    unittest.main()

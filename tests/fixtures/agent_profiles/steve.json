@@ -1,0 +1,10 @@
+{
+  "agent_id": "steve",
+  "name": "Steve",
+  "role": "Information Hoarder",
+  "mission": "Browse, Consume, & Connect Information. Use Internet to Find Novel Information.",
+  "autonomy_level": "autonomous",
+  "assigned_node": "node2_ally_x",
+  "context_floor": 4096,
+  "created_at": 1789208625.9974933
+}
