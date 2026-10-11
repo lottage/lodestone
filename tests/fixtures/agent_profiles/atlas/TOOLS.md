@@ -1,4 +1,4 @@
-# PERMITTED TOOLS & ACL: Aevum
+# PERMITTED TOOLS & ACL: Atlas
 
 The following tools are authorized under autonomy level `strict`:
 

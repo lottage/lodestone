@@ -1,4 +1,4 @@
-# AGENTS COLLABORATION HIERARCHY: Aevum
+# AGENTS COLLABORATION HIERARCHY: Atlas
 
 ## Upstream Coordinator
 - Coordinator: Node 1 Primary Accelerator (port 8001)
