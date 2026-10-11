@@ -97,10 +97,24 @@ class TestEndpoints(unittest.TestCase):
         self.assertEqual(cmd[0], "ssh")
         self.assertIn("StrictHostKeyChecking=accept-new", cmd)
         self.assertIn("ConnectTimeout=5", cmd)
-        self.assertEqual(cmd[-2:], ["ops@10.0.0.5", "uptime"])
+        self.assertEqual(cmd[-3:], ["--", "ops@10.0.0.5", "uptime"])
+        strict = dict(CFG, ssh={"host_key_checking": "yes"})
+        self.assertIn("StrictHostKeyChecking=yes", endpoints.ssh_cmd(strict, "x", target="root@h", no_stdin=True))
+        self.assertEqual(endpoints.ssh_cmd(strict, "x", target="root@h", no_stdin=True)[1], "-n")
+        # "no" (trust any host) is not offered, even if a config says it
         lab = dict(CFG, ssh={"host_key_checking": "no"})
-        self.assertIn("StrictHostKeyChecking=no", endpoints.ssh_cmd(lab, "x", target="root@h", no_stdin=True))
-        self.assertEqual(endpoints.ssh_cmd(lab, "x", target="root@h", no_stdin=True)[1], "-n")
+        self.assertIn("StrictHostKeyChecking=accept-new", endpoints.ssh_cmd(lab, "x", target="root@h"))
+        self.assertNotIn("StrictHostKeyChecking=no", endpoints.ssh_cmd(lab, "x", target="root@h"))
+
+    def test_ssh_target_cannot_carry_an_option(self):
+        """A user or host that starts with '-' would be read by ssh as an option (-oProxyCommand=...): refused, and `--`
+        ends the options before the target anyway."""
+        self.assertEqual(endpoints.ssh_cmd(CFG, "uptime")[-3:], ["--", "ops@10.0.0.5", "uptime"])
+        for bad in ("-oProxyCommand=x@h", "root@-oProxyCommand=x", "a b@h", "root@h;id"):
+            with self.assertRaises(ValueError, msg=bad):
+                endpoints.ssh_cmd(CFG, "x", target=bad)
+        with self.assertRaises(ValueError):
+            endpoints.ssh_target(dict(CFG, cluster=dict(CFG.get("cluster", {}), ssh_user="-oProxyCommand=x")))
 
 
 if __name__ == "__main__":

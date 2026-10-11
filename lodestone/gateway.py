@@ -17,7 +17,7 @@ routes by what the request says:
 Why it relays instead of redirecting: the engines listen on private addresses, and only the gateway has to be exposed.
 Why streams are relayed chunk by chunk: a token-by-token reply that waits for the whole answer is a different product.
 Keys: gateway.api_key (or env LODESTONE_API_KEY) turns on `Authorization: Bearer`; it is compared in constant time and
-never logged. Without one the default bind is loopback only; binding wider with no key is logged as a warning.
+never logged. Without one it listens on loopback only: binding anywhere wider with no key is refused (it will not start).
 Not here yet: per-key quotas, Boost routing, upstream keys (see docs/LAYERS.md).
 """
 
@@ -324,11 +324,12 @@ def make_server(cfg: Dict[str, Any], host: Optional[str] = None, port: Optional[
     """A bound, not yet serving, gateway (port 0 = pick a free one: the tests do)."""
     gw = Gateway(cfg)
     host = host if host is not None else str(gw.setting("host"))
+    if not gw.api_key and host not in ("127.0.0.1", "localhost", "::1"):
+        # fail closed: an engine in front of a network with no key is a free model for everyone on it (and for any web page)
+        raise RuntimeError("the gateway will not listen on %s without a key: set gateway.api_key or LODESTONE_API_KEY" % host)
     srv = ThreadingHTTPServer((host, int(gw.setting("port") if port is None else port)), _make_handler(gw))
     srv.daemon_threads = True
     srv.gateway = gw  # type: ignore[attr-defined]
-    if not gw.api_key and host not in ("127.0.0.1", "localhost", "::1"):
-        sys.stderr.write("[gateway] WARNING: listening on %s with no API key (set gateway.api_key)\n" % host)
     return srv
 
 
@@ -337,7 +338,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--host")
     ap.add_argument("--port", type=int)
     args = ap.parse_args(argv)
-    srv = make_server(load_cfg(), args.host, args.port)
+    try:
+        srv = make_server(load_cfg(), args.host, args.port)
+    except RuntimeError as e:
+        sys.stderr.write("[gateway] %s\n" % e)
+        return 2
     print("[gateway] serving on http://%s:%d (key %s)" % (srv.server_address[0], srv.server_address[1],
                                                            "required" if srv.gateway.api_key else "off"))  # type: ignore[attr-defined]
     try:

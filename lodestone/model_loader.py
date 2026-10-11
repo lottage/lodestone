@@ -78,7 +78,7 @@ def _ssh_target(cfg: Dict[str, Any]) -> str:
 
 
 def _ssh(cfg: Dict[str, Any], cmd: str, stdin: Optional[str] = None, timeout: float = 20) -> subprocess.CompletedProcess:
-    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", _ssh_target(cfg), cmd],
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", _ssh_target(cfg), cmd],
                           input=stdin, capture_output=True, text=True, timeout=timeout)
 
 
@@ -126,7 +126,7 @@ def parse_unit(text: str, value_flags: Optional[set] = None) -> Dict[str, Any]:
         parts[-1] = parts[-1].rstrip()[:-1]
         end += 1
         parts.append(lines[end])
-    tokens = shlex.split(" ".join(parts))
+    tokens = [t.replace("%%", "%").replace("$$", "$") for t in shlex.split(" ".join(parts))]    # the doubling unit_token adds
     binary, args, i = tokens[0], [], 1
     while i < len(tokens):
         tok = tokens[i]
@@ -205,16 +205,35 @@ def current_options(unit: Dict[str, Any], opts: List[Dict[str, Any]]) -> Dict[st
     return out
 
 
+CONTROL_CHARS = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")      # a newline in a unit value would start a new directive
+FLAG_NAME = re.compile(r"^-{1,2}[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def unit_token(value: str) -> str:
+    """One value as a systemd ExecStart= word: no control characters at all (ValueError), `%` and `$` doubled so systemd does
+    not expand them, then shell-quoted. parse_unit undoes the doubling, so a unit round-trips."""
+    v = str(value)
+    if CONTROL_CHARS.search(v):
+        raise ValueError("a value for the engine unit contains a control character (newline, NUL...)")
+    return shlex.quote(v.replace("%", "%%").replace("$", "$$"))
+
+
 def render_unit(unit: Dict[str, Any], description: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> str:
     lines = list(unit["lines"])
-    body = [f"ExecStart={unit['binary']} \\"]
+    if CONTROL_CHARS.search(str(unit["binary"])) or any(not FLAG_NAME.match(str(f)) for f, _ in unit["args"]):
+        raise ValueError("the engine unit has a flag name or program path that is not plain")
+    body = [f"ExecStart={unit_token(unit['binary'])} \\"]
     for n, (f, v) in enumerate(unit["args"]):
         tail = "" if n == len(unit["args"]) - 1 else " \\"
-        body.append(f"    {f}{' ' + shlex.quote(v) if v is not None else ''}{tail}")
+        body.append(f"    {f}{' ' + unit_token(v) if v is not None else ''}{tail}")
     lines[unit["start"]:unit["end"] + 1] = body
     if description:
+        if CONTROL_CHARS.search(description):
+            raise ValueError("the description contains a control character")
         lines = [f"Description={description}" if l.startswith("Description=") else l for l in lines]
     for key, val in (env or {}).items():
+        if CONTROL_CHARS.search(f"{key}{val}") or '"' in f"{key}{val}" or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key)):
+            raise ValueError("an Environment value for the engine unit is not plain")
         new = f'Environment="{key}={val}"'
         hit = [i for i, l in enumerate(lines) if re.match(rf'Environment="?{re.escape(key)}=', l)]
         if hit:

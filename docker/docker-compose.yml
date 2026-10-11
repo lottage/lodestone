@@ -110,7 +110,7 @@ services:
     environment:
       COORDINATOR_URL: "http://coordinator:8001/v1"
       EMBEDDER_URL: "http://embedder:8003/v1"
-      LODESTONE_API_KEY: "${LODESTONE_API_KEY:-}"
+      LODESTONE_API_KEY: "${LODESTONE_API_KEY:?set LODESTONE_API_KEY in .env}"
       COORDINATOR_CPU: "1"
     ports: ["${LODESTONE_BIND:-127.0.0.1}:${GATEWAY_PORT:-8000}:8000"]
     healthcheck:

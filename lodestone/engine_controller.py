@@ -381,8 +381,8 @@ def fetch_journal_logs(service_name: str, lines: int = 100, ssh_host: str = "", 
         return ["Invalid service name"]
         
     cmd = [
-        "ssh", 
-        f"{ssh_user}@{ssh_host}", 
+        "ssh", "-o", "BatchMode=yes", "--",
+        endpoints.check_ssh_target(f"{ssh_user}@{ssh_host}"),
         f"journalctl -u {service_name}.service -n {lines} --no-pager"
     ]
     

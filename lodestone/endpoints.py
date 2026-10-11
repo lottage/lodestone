@@ -10,11 +10,12 @@ not warned about unless the config has a section of its own for them; `missing(c
     endpoints.url("coordinator", cfg)          -> "http://10.0.0.5:8001/v1" (from cluster.coordinator_url)
     endpoints.host("valkey", cfg), endpoints.port("valkey", cfg)
     endpoints.ssh_target(cfg)                  -> "user@engine-host"  (cluster.ssh_user @ the coordinator's host)
-    endpoints.ssh_cmd(cfg, "systemctl ...")    -> ["ssh", "-o", "BatchMode=yes", ..., "user@host", "systemctl ..."]
+    endpoints.ssh_cmd(cfg, "systemctl ...")    -> ["ssh", "-o", "BatchMode=yes", ..., "--", "user@host", "systemctl ..."]
 """
 
 import getpass
 import os
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
@@ -163,20 +164,40 @@ def ssh_user(cfg: Optional[Dict[str, Any]] = None) -> str:
     return (_cfg(cfg).get("cluster") or {}).get("ssh_user") or os.environ.get("STONESAGE_SSH_USER") or getpass.getuser()
 
 
+SSH_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._:-]{0,252}$")      # a user or host name: never starts with '-' (an ssh option)
+HOST_KEY_MODES = ("yes", "accept-new")                                 # "no" (trust anyone) is not offered, even if a config says it
+
+
 def ssh_target(cfg: Optional[Dict[str, Any]] = None, host_name: str = "") -> str:
     cfg = _cfg(cfg)
-    return f"{ssh_user(cfg)}@{host_name or host('coordinator', cfg)}"
+    user, where = str(ssh_user(cfg)), str(host_name or host('coordinator', cfg))
+    if not SSH_NAME.match(user) or not SSH_NAME.match(where):
+        raise ValueError("ssh user or host in the config is not a plain name or address")
+    return f"{user}@{where}"
 
 
 def ssh_options(cfg: Optional[Dict[str, Any]] = None, connect_timeout: Optional[int] = None, batch: bool = True) -> List[str]:
     """batch=False for an interactive session (a terminal): it may ask for a password."""
     checking = (_cfg(cfg).get("ssh") or {}).get("host_key_checking") or "accept-new"
+    if checking not in HOST_KEY_MODES:
+        checking = "accept-new"
     opts = (["-o", "BatchMode=yes"] if batch else []) + ["-o", f"StrictHostKeyChecking={checking}"]
-    return opts + (["-o", f"ConnectTimeout={connect_timeout}"] if connect_timeout else [])
+    return opts + (["-o", f"ConnectTimeout={int(connect_timeout)}"] if connect_timeout else [])
+
+
+def check_ssh_target(target: str) -> str:
+    """The target back when it is a plain `user@host` (or `host`); ValueError when either part could be read as an ssh option."""
+    user, _, where = str(target).rpartition("@")
+    if not SSH_NAME.match(where) or (user and not SSH_NAME.match(user)):
+        raise ValueError("ssh target is not a plain user@host")
+    return str(target)
 
 
 def ssh_cmd(cfg: Optional[Dict[str, Any]], *remote: str, target: str = "", no_stdin: bool = False,
             connect_timeout: Optional[int] = None) -> List[str]:
     """argv for running `remote` on the engines' host (or `target`, "user@host")."""
     cfg = _cfg(cfg)
-    return ["ssh"] + (["-n"] if no_stdin else []) + ssh_options(cfg, connect_timeout) + [target or ssh_target(cfg)] + list(remote)
+    if target:
+        check_ssh_target(target)
+    # `--` ends ssh's options, so nothing in the target can be read as one
+    return ["ssh"] + (["-n"] if no_stdin else []) + ssh_options(cfg, connect_timeout) + ["--", target or ssh_target(cfg)] + list(remote)

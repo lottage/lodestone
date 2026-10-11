@@ -276,13 +276,17 @@ class ComposeRulesTests(unittest.TestCase):
                     self.assertNotIn(var, senv, (label, want, "an absent role is not configured"))
         gw = svcs["gateway"]
         self.assertEqual(flag(gw["command"], "--host"), "0.0.0.0")
-        self.assertEqual(gw["environment"]["LODESTONE_API_KEY"], "${LODESTONE_API_KEY:-}")
+        self.assertEqual(gw["environment"]["LODESTONE_API_KEY"], "${LODESTONE_API_KEY:?set LODESTONE_API_KEY in .env}",
+                         "the gateway never starts without a key")
         self.assertEqual(gw["ports"], ["${LODESTONE_BIND:-127.0.0.1}:${GATEWAY_PORT:-8000}:8000"], "loopback unless .env says otherwise")
         self.assertEqual(set(gw["depends_on"]), set(roles))
         self.assertTrue(all(v == {"condition": "service_healthy"} for v in gw["depends_on"].values()))
         ss = svcs["stonesage"]
         self.assertEqual(ss["environment"]["STONESAGE_APPS"], "hearth")
         self.assertEqual(ss["environment"]["HASS_TOKEN"], "${HASS_TOKEN:-}")
+        self.assertEqual(ss["environment"]["STONESAGE_API_KEY"], "${STONESAGE_API_KEY:?set STONESAGE_API_KEY in .env}",
+                         "the cockpit never starts open: compose stops when .env has no key")
+        self.assertIn("/api/health", ss["healthcheck"]["test"][-1], "the healthcheck uses the public route, no key needed")
         self.assertEqual(ss["ports"], ["${STONESAGE_BIND:-127.0.0.1}:${STONESAGE_PORT:-8888}:8888"])
         self.assertEqual(ss["volumes"], ["stonesage-config:/config", "stonesage-data:/data"])
         self.assertEqual(set(ss["depends_on"]), {"coordinator", "embedder"} & set(roles) | {"coordinator"})
@@ -439,6 +443,21 @@ class WriteTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.tmp)), [".env", "docker-compose.yml"])
         load_yaml(slurp(os.path.join(self.tmp, "docker-compose.yml")))
         self.assertTrue(any("docker compose up -d" in l for l in lines))
+
+    def test_keys_are_generated_into_env_and_kept_on_a_rerun(self):
+        self.run_main("--docker", "--out", self.tmp)
+        env = os.path.join(self.tmp, ".env")
+        first = dict(l.split("=", 1) for l in slurp(env).splitlines() if "=" in l and not l.startswith("#"))
+        for name in ("STONESAGE_API_KEY", "LODESTONE_API_KEY"):
+            self.assertGreaterEqual(len(first[name]), 40, name)
+        self.assertNotEqual(first["STONESAGE_API_KEY"], first["LODESTONE_API_KEY"])
+        if os.name != "nt":
+            self.assertEqual(os.stat(env).st_mode & 0o777, 0o600)
+        self.run_main("--docker", "--out", self.tmp)           # a re-run keeps the keys (and so changes nothing)
+        again = dict(l.split("=", 1) for l in slurp(env).splitlines() if "=" in l and not l.startswith("#"))
+        self.assertEqual(first, again)
+        self.assertNotIn(".env.new", os.listdir(self.tmp))
+        self.assertNotIn(first["STONESAGE_API_KEY"], slurp(os.path.join(self.tmp, "docker-compose.yml")), "no key in the compose file")
 
     def test_rerun_backs_up_the_compose_file_and_keeps_your_env(self):
         self.run_main("--docker", "--out", self.tmp)

@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import json
+import shlex
 import re
 import urllib.error
 import urllib.parse
@@ -20,6 +21,9 @@ import logging
 from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("StoneSage.Downloader")
+
+
+VALID_MODEL_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.gguf", re.IGNORECASE)
 
 
 def normalize_download_url(raw_url: str, custom_filename: Optional[str] = None) -> Tuple[str, str]:
@@ -163,6 +167,14 @@ class ModelDownloadManager:
         filename = (custom_filename or "").strip() or default_fn
         if not filename.lower().endswith(".gguf"):
             filename = f"{filename}.gguf"
+        if not VALID_MODEL_FILE.fullmatch(filename):
+            # the name becomes a path on the engine host (and part of a remote rm): plain characters only, no folders
+            return {"ok": False, "error": "Invalid model filename (letters, digits, . _ - and ending in .gguf; no folders)."}
+        try:
+            from lodestone.urlcheck import check_fetch_url
+            check_fetch_url(url, resolve=False)          # http(s) only; never file://, loopback or a metadata address
+        except ValueError as e:
+            return {"ok": False, "error": f"That URL is not fetched: {e}"}
 
         with self.lock:
             if self._state.get("active"):
@@ -382,10 +394,14 @@ except Exception as ex:
 
     def _cancel_remote_download(self, filename: str):
         """Signals the engine host downloader to abort and clean up."""
+        if not VALID_MODEL_FILE.fullmatch(str(filename or "")):
+            logger.warning("Remote cancel: refusing to remove a file whose name is not plain")
+            filename = "none.gguf"
+        part = shlex.quote(f"/opt/models/{filename}.part")
         cancel_cmd = (
             "touch /tmp/stonesage_dl.cancel && "
             "pkill -f 'stonesage_dl' || true && "
-            f"rm -f /opt/models/{filename}.part /tmp/stonesage_dl_status.json"
+            f"rm -f -- {part} /tmp/stonesage_dl_status.json"
         )
         cmd = endpoints.ssh_cmd(None, cancel_cmd, target=self._target())
         try:

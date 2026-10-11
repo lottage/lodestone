@@ -274,6 +274,16 @@ class GatewayTest(unittest.TestCase):
         os.environ.pop("LODESTONE_API_KEY", None)
         self.assertEqual(call(self.base, "/v1/models")[0], 200)
 
+    def test_it_will_not_listen_beyond_loopback_without_a_key(self):
+        os.environ.pop("LODESTONE_API_KEY", None)
+        for host in ("0.0.0.0", "192.0.2.10", "::"):
+            with self.assertRaises(RuntimeError, msg=host):
+                gateway.make_server({"cluster": {}}, host, 0)
+        srv = gateway.make_server({"gateway": {"api_key": "k-0123456789"}}, "0.0.0.0", 0)      # with a key it may
+        srv.server_close()
+        srv = gateway.make_server({}, "127.0.0.1", 0)
+        srv.server_close()
+
     def test_key_required_when_configured(self):
         self.start({"api_key": "test-key-123"})
         status, _, raw = call(self.base, "/v1/models")

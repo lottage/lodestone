@@ -79,11 +79,16 @@ def _base(url: str) -> str:
     return url[:-3] if url.endswith("/v1") else url
 
 
+def _ssh_check(target: str) -> str:
+    from lodestone import endpoints          # (endpoints imports this module: look it up when used)
+    return endpoints.check_ssh_target(target)
+
+
 def run_probe(host: str, user: str, timeout: float = 10.0) -> Dict[str, Any]:
     if os.environ.get("STONESAGE_OFFLINE"):
         return {"error": "offline"}
     try:
-        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", f"{user}@{host}", PROBE_CMD],
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "--", _ssh_check(f"{user}@{host}"), PROBE_CMD],
                              capture_output=True, text=True, timeout=timeout)
         if out.returncode != 0:
             return {"error": (out.stderr or f"exit {out.returncode}").strip()[:200]}
@@ -231,8 +236,8 @@ def get_models(cfg: Dict[str, Any], fresh: bool = False) -> list:
     if not host or os.environ.get("STONESAGE_OFFLINE"):
         return []
     try:
-        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", f"{_ssh_user(cfg)}@{host}",
-                              PROBE_CMD + " --models"], capture_output=True, text=True, timeout=60)
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "--",
+                              _ssh_check(f"{_ssh_user(cfg)}@{host}"), PROBE_CMD + " --models"], capture_output=True, text=True, timeout=60)
         items = json.loads(out.stdout).get("models", []) if out.returncode == 0 else []
     except Exception:
         items = []

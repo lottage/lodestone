@@ -41,7 +41,8 @@ and one key instead of one port per model. It serves `/v1/chat/completions`, `/v
 (a role alias such as `coordinator`, `worker` or `vision`, or a model id), and streamed replies are relayed chunk by
 chunk. Configuration lives under `gateway` in `config.json`: `gateway.host` (default `127.0.0.1`), `gateway.port`
 (default `8000`) and `gateway.api_key`, or the `LODESTONE_API_KEY` environment variable, which turns on
-`Authorization: Bearer` checking. Binding beyond loopback without a key logs a warning.
+`Authorization: Bearer` checking. Without a key the gateway listens on loopback only: asking it to bind anywhere wider
+without one is refused, and it will not start.
 
 ## Install with Docker
 
@@ -51,7 +52,7 @@ else has to be installed besides Docker itself:
 ```
 pip install git+https://github.com/lottage/lodestone
 python -m lodestone.installer --docker          # looks at the machine, writes docker-compose.yml and .env here
-# fill LODESTONE_API_KEY in .env (the gateway), then
+# the installer wrote your API keys into .env; start the stack
 docker compose up -d
 ```
 
@@ -69,9 +70,10 @@ docker compose up -d
   only until you change `LODESTONE_BIND`), with the engines reached by service name;
 - `stonesage`: the StoneSage cockpit with the Hearth app on `http://localhost:8888`; leave it out with `--no-stonesage`.
 
-Engines are not published on any port, and no secret is written into the generated files: `.env` holds the empty
-`LODESTONE_API_KEY=` and `HASS_TOKEN=` for you to fill. Re-running the generator replaces the Compose file (keeping a
-`.bak-<time>` copy) and never touches an existing `.env`.
+Engines are not published on any port, and no secret is written into the Compose file: `.env` (owner-only) holds the
+`LODESTONE_API_KEY` (the gateway's bearer) and `STONESAGE_API_KEY` (the cockpit's login) the installer generated, plus an
+empty `HASS_TOKEN=` for you to fill; `docker compose up` stops if a key is missing. Re-running the generator replaces the
+Compose file (keeping a `.bak-<time>` copy) and never touches an existing `.env`, whose keys it reuses.
 
 | Docker on | CPU | NVIDIA GPU | AMD or Intel GPU |
 | --- | --- | --- | --- |
@@ -128,8 +130,8 @@ about 6.5 GB to spare). What `--apply` does, in order, stopping at the first fai
    the old file is copied to `<file>.bak-<time>` first;
 8. starts everything and waits for each `/health`.
 
-Re-running is safe: a finished build, a downloaded model and an unchanged file are skipped. Set `gateway.api_key`
-before exposing the gateway beyond the machine. Needs Linux with `apt`, root, and about 3 GB plus the models of free
+Re-running is safe: a finished build, a downloaded model and an unchanged file are skipped. The gateway listens on the
+machine only; set `gateway.api_key` before pointing it at your network (it refuses to start otherwise). Needs Linux with `apt`, root, and about 3 GB plus the models of free
 disk space. The installer itself is standard library only. It has been tested offline against fixture output; a run
 on real hardware is still to come.
 
@@ -144,6 +146,36 @@ From a checkout:
 ```
 pip install -e .
 ```
+
+## Security
+
+The cockpit and its API need a login. There is one server key; nothing is served without it except the login page, the web
+UI's static files and a bare `/api/health` (`ok` and a version).
+
+- **Where the key is.** `STONESAGE_API_KEY` in the environment, else `api.key` in `config.json`. If neither exists when the
+  server starts, it generates one, saves it into `config.json` (owner-only) and logs where, never the key. Read it with
+  `python -m stonesage.auth show-key`; with Docker it is the `STONESAGE_API_KEY` line of the `.env` the installer wrote.
+  Delete `api.key` and restart for a new one (every login ends).
+- **Browsers** enter the key once on the login page and get an HttpOnly, SameSite=Strict session cookie (Secure over HTTPS).
+  A cookie request that changes something must also come from the same origin. **Scripts** send `Authorization: Bearer <key>`
+  (also for `/v1`, the Boost proxy and `/metrics`). Wrong keys are counted per address and locked out for a few minutes.
+- **No cross-origin access.** There is no CORS: a web page on another site gets nothing, and the `Host` header must be an IP
+  address, `localhost` or a name in `api.allowed_hosts` (defence against DNS rebinding).
+- **Machines that cannot send a header** (Home Assistant's Ollama integration, a Prometheus server) can be listed by address in
+  `api.trusted_hosts`; they then reach only the Ollama-style routes and `/metrics`, nothing else.
+- **Dangerous features are off.** Four things stay behind a second switch in `config.json` (`features`), each also behind the
+  login: `web_terminal` (the shell route and the PTY WebSocket on 127.0.0.1:8088), `code_tools` (tools whose code the server
+  runs), `file_editor` (read and write inside the configured workspace folders only) and `raw_ha_call` (a raw Home Assistant
+  service call, in Hearth). A route whose feature is off answers 404.
+- **The settings API cannot grant itself powers.** `api`, `features`, `apps` and `workspace_roots` are not writable through it,
+  and changing the address of something that has a stored token or key (Home Assistant, a Boost provider, Proxmox) needs that
+  secret entered again in the same request. `GET /api/config` masks every key, token, password and cookie.
+- **Approvals belong to the person who was asked.** A pending "shall I unlock the door?" is stored under the caller plus its own
+  conversation id; ids that look like the server's own (`ha:`, `alexa:`, `api:`...) are ignored.
+
+An upgrade from a version without a login: start it once (the key is generated), open the cockpit, enter the key, and add
+`api.trusted_hosts` / `api.allowed_hosts` for the machines and names that need them. See docs/LAYERS.md in the Hearth repository
+if you use the Home app; the protections are described there.
 
 ## Tests
 
