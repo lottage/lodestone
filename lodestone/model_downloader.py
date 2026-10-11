@@ -10,6 +10,7 @@ import sys
 import time
 import json
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 import threading
@@ -484,3 +485,141 @@ except Exception as ex:
 
 # Global singleton instance
 model_download_manager = ModelDownloadManager()
+
+
+# =========================================================================
+# Plain file download: no state, no SSH. lodestone.installer runs this as
+#   python3 -m lodestone.model_downloader --repo OWNER/NAME --file FILE.gguf --dest DIR
+# =========================================================================
+
+SUMS_NAME = "SHA256SUMS"
+
+
+def hf_resolve_url(repo: str, filename: str) -> str:
+    """The direct download URL of one file in a Hugging Face repository (main branch)."""
+    return "https://huggingface.co/%s/resolve/main/%s?download=true" % (repo.strip("/"), urllib.parse.quote(filename))
+
+
+def sha256_file(path: str, chunk: int = 1 << 20) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(chunk)
+            if not block:
+                return h.hexdigest()
+            h.update(block)
+
+
+def read_sums(dest_dir: str) -> Dict[str, str]:
+    """{filename: sha256} from DEST/SHA256SUMS (the `sha256sum` format: hash, two spaces, name)."""
+    out: Dict[str, str] = {}
+    try:
+        with open(os.path.join(dest_dir, SUMS_NAME), encoding="utf-8") as f:
+            for line in f:
+                digest, _, name = line.strip().partition("  ")
+                if digest and name:
+                    out[name] = digest
+    except OSError:
+        pass
+    return out
+
+
+def record_sha256(dest_dir: str, filename: str, digest: str) -> None:
+    """Add or replace one line of DEST/SHA256SUMS, so `sha256sum -c` works there."""
+    sums = read_sums(dest_dir)
+    sums[filename] = digest
+    path = os.path.join(dest_dir, SUMS_NAME)
+    with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+        for name in sorted(sums):
+            f.write("%s  %s\n" % (sums[name], name))
+    os.replace(path + ".tmp", path)
+
+
+def download_file(url: str, dest_dir: str, filename: str, opener=None, timeout: float = 60,
+                  progress=None) -> Dict[str, Any]:
+    """Download url to dest_dir/filename. Atomic (written as .part, renamed when complete), resumes a .part, and does
+    nothing when the file is already there with the size the server reports. Returns
+    {"status": "present" | "downloaded", "path", "size"}; raises OSError when it cannot finish."""
+    opener = opener or urllib.request.urlopen
+    os.makedirs(dest_dir, exist_ok=True)
+    final = os.path.join(dest_dir, filename)
+    part = final + ".part"
+    have = os.path.getsize(part) if os.path.isfile(part) else 0
+    headers = {"User-Agent": "Lodestone/1"}
+    if have:
+        headers["Range"] = "bytes=%d-" % have
+    try:
+        resp = opener(urllib.request.Request(url, headers=headers), timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and have:        # the .part already holds everything
+            os.replace(part, final)
+            return {"status": "downloaded", "path": final, "size": os.path.getsize(final)}
+        if os.path.isfile(final):
+            return {"status": "present", "path": final, "size": os.path.getsize(final)}
+        raise OSError("download of %s failed: HTTP %s" % (filename, e.code))
+    except Exception as e:
+        if os.path.isfile(final):         # offline: trust what is there
+            return {"status": "present", "path": final, "size": os.path.getsize(final)}
+        raise OSError("download of %s failed: %s" % (filename, e))
+    with resp:
+        length = int(resp.headers.get("Content-Length") or 0)
+        resumed = getattr(resp, "status", 200) == 206
+        total = (have + length) if resumed else length
+        if os.path.isfile(final) and total and os.path.getsize(final) == total:
+            return {"status": "present", "path": final, "size": total}
+        written = have if resumed else 0
+        with open(part, "ab" if resumed else "wb") as out:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                written += len(chunk)
+                if progress:
+                    progress(written, total)
+    if total and written != total:
+        raise OSError("download of %s stopped at %d of %d bytes (run again to resume)" % (filename, written, total))
+    os.replace(part, final)
+    return {"status": "downloaded", "path": final, "size": written}
+
+
+def main(argv: Optional[list] = None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="python -m lodestone.model_downloader",
+                                 description="Download one GGUF file and record its SHA-256 in DEST/SHA256SUMS.")
+    ap.add_argument("--repo", help="Hugging Face repository, OWNER/NAME")
+    ap.add_argument("--file", help="file name inside the repository (with --repo)")
+    ap.add_argument("--url", help="a direct URL instead of --repo/--file")
+    ap.add_argument("--dest", required=True, help="directory to put the file in")
+    ap.add_argument("--filename", help="save under this name (default: the file's own)")
+    args = ap.parse_args(argv)
+    if args.url:
+        url, name = normalize_download_url(args.url, args.filename)
+    elif args.repo and args.file:
+        url, name = hf_resolve_url(args.repo, args.file), args.file
+    else:
+        ap.error("give --repo and --file, or --url")
+    name = args.filename or name
+    last = [0.0]
+
+    def progress(done: int, total: int) -> None:
+        if time.time() - last[0] >= 5:
+            last[0] = time.time()
+            print("  %s: %.0f of %.0f MB" % (name, done / 1048576, total / 1048576), flush=True)
+
+    try:
+        got = download_file(url, args.dest, name, progress=progress)
+    except OSError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
+    digest = read_sums(args.dest).get(name) if got["status"] == "present" else None
+    if not digest:
+        digest = sha256_file(got["path"])
+        record_sha256(args.dest, name, digest)
+    print("%s: %s (%.0f MB), sha256 %s" % (name, got["status"], got["size"] / 1048576, digest))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

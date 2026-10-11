@@ -1,0 +1,64 @@
+name: Docker image
+
+# Builds the image on pull requests that touch it, on tags and on demand. Nothing is pushed by default: the publish job at
+# the bottom stays skipped until the repository variable PUBLISH_IMAGES is set to "true" (Settings > Secrets and variables >
+# Actions > Variables), which the owner does when images may go to ghcr.io.
+on:
+  pull_request:
+    paths: [Dockerfile, .dockerignore, "docker/**", "lodestone/**", pyproject.toml, ".github/workflows/docker.yml"]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/lottage/lodestone
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: false
+          tags: ${{ env.IMAGE }}:ci
+
+  publish:
+    # OFF until PUBLISH_IMAGES is "true" and a version tag is pushed.
+    if: ${{ vars.PUBLISH_IMAGES == 'true' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

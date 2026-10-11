@@ -1,0 +1,20 @@
+# What a Docker build context leaves out. Copied to the root of each public repository.
+.git
+.github
+.gitignore
+.gitattributes
+.venv
+venv
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+build
+dist
+tests
+# local state and secrets: never in an image
+config.json
+**/config.json
+data
+.env
+**/.env
+*.bak-*

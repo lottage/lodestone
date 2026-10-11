@@ -1,0 +1,1179 @@
+"""Install Lodestone on a fresh machine (docs/LAYERS.md M4): engines plus the gateway, from a bare Ubuntu 24.04.
+
+    python -m lodestone.installer                       # review: detect the machine, print the plan, change nothing
+    sudo python -m lodestone.installer --apply          # run it, step by step, stopping at the first failure
+    options: --profile auto|gpu-large|gpu-small|cpu   --prefix /opt/lodestone   --config PATH   --vision   --json
+
+    python -m lodestone.installer --docker [--gpu auto|vulkan|cuda|cpu] [--out DIR]     # the same plan as a Docker Compose stack
+
+Two ways in. Docker (below, "Docker") is for users on any OS that runs Docker; this file's native steps (the numbered list)
+are the bare-metal path: Ubuntu 24.04, systemd units, llama.cpp built from source.
+
+What it does, in order (each step says why when printed):
+    1. checks   Linux, root, Ubuntu/Debian, free disk, RAM
+    2. packages apt: a compiler, cmake, git and (GPU profiles) the Vulkan headers, drivers and shader compiler
+    3. user     a system user `lodestone` (member of render and video, which GPU access needs)
+    4. llama.cpp   cloned at ONE pinned commit (LLAMA_CPP_REF) and built with cmake: Vulkan for the GPU profiles,
+                   plain CPU otherwise; the binary lands in PREFIX/bin/llama-server
+    5. models   the profile's GGUF files from Hugging Face through lodestone.model_downloader (atomic, resumable,
+                SHA-256 recorded in PREFIX/models/SHA256SUMS)
+    6. units    one systemd unit per engine (coordinator, worker, embedder, optional vision) and one for the gateway
+    7. config   endpoint keys (cluster.*_url, gateway.*) merged into the config file: nothing is dropped, a key that is
+                already set is kept, the old file is copied to <file>.bak-<time> first
+    8. start    systemctl enable --now, then wait for every /health
+
+Hardware: GPUs are driven through Vulkan (AMD, Intel and NVIDIA all have a Vulkan driver); no GPU, or one too small, means
+the CPU profile. The profile comes from the VRAM of the largest discrete GPU (`auto`) or from --profile. Every engine
+listens on 127.0.0.1 only; the gateway is the one address to expose (and it should get gateway.api_key first).
+
+Design: detect() turns text (os-release, /proc/meminfo, `vulkaninfo --summary`, sysfs, nvidia-smi) into one dict through small
+pure parsers; plan() turns that dict into an ordered list of steps (data, nothing executed); apply() runs them, or only
+prints them (the default). A dry run still probes the machine, read-only (vulkaninfo, nvidia-smi, llama-server --version).
+Standard library only. NOT yet tried on real hardware: see docs/LAYERS.md (M4).
+
+Rules baked into every unit (learned the hard way on the project's own engines):
+  --device VulkanN (never an integer) with GGML_VK_VISIBLE_DEVICES pinning the card, so VulkanN is "the Nth visible";
+  --flash-attn always with a value; --jinja on the chat engines (native tool calls); --metrics on (the gateway and
+  the metrics readers use it); an ExecStartPre that waits until Vulkan sees every GPU, because an engine that starts
+  before the driver is ready silently runs on the CPU.
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+UNKNOWN = "unknown"
+DEFAULT_PREFIX = "/opt/lodestone"
+SERVICE_USER = "lodestone"
+ENGINE_HOST = "127.0.0.1"
+GATEWAY_PORT = 8000
+
+# llama.cpp: ONE pinned commit (full SHA), the build the project's own engines were verified on (2026-09-04, mainline).
+# Newer is not better here: a flag that moves or disappears breaks every unit below. Change it deliberately: build it, run
+# the engines, then edit this line. The build is skipped when PREFIX/bin/llama-server.ref already holds this value.
+LLAMA_CPP_URL = "https://github.com/ggml-org/llama.cpp"
+LLAMA_CPP_REF = "8b4b3558f1459c13e4aa38d5c94d306a00dc6acd"
+
+# --------------------------------------------------------------------------------------------------- the tables ----
+# Every model the installer can fetch: key -> Hugging Face repository + file name (checked against the repositories'
+# file lists 2026-10-10); size_bytes is what those files weighed then: it lets a re-run skip a finished download without
+# the network, and feeds the free-disk check. A stale size only costs one network check (the downloader asks the server).
+MODELS: Dict[str, Dict[str, Any]] = {
+    "qwen3-14b-q4_k_m": {"repo": "Qwen/Qwen3-14B-GGUF", "file": "Qwen3-14B-Q4_K_M.gguf", "size_bytes": 9001752960},
+    "qwen3-8b-q4_k_m": {"repo": "Qwen/Qwen3-8B-GGUF", "file": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 5027783488},
+    "granite-4.0-h-tiny-q4_k_m": {"repo": "ibm-granite/granite-4.0-h-tiny-GGUF", "file": "granite-4.0-h-tiny-Q4_K_M.gguf",
+                                  "size_bytes": 4230976352},
+    "qwen2.5-coder-3b-q5_k_m": {"repo": "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF", "file": "qwen2.5-coder-3b-instruct-q5_k_m.gguf",
+                                "size_bytes": 2438740416},
+    "bge-large-en-v1.5-f16": {"repo": "CompendiumLabs/bge-large-en-v1.5-gguf", "file": "bge-large-en-v1.5-f16.gguf",
+                              "size_bytes": 669603712},
+    "qwen2.5-vl-7b-q4_k_m": {"repo": "ggml-org/Qwen2.5-VL-7B-Instruct-GGUF", "file": "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+                             "size_bytes": 4683072032},
+    "qwen2.5-vl-7b-mmproj-f16": {"repo": "ggml-org/Qwen2.5-VL-7B-Instruct-GGUF",
+                                 "file": "mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf", "size_bytes": 1354162912},
+}
+
+# Roles per profile. vram_mb is the room the engine needs at these settings (weights + KV cache + compute buffers,
+# measured on the project's engines, rounded up); fallback says what happens when no GPU has that much left:
+# "cpu" runs it on the CPU, "omit" leaves the role out. kind: chat | embedding | vision.
+PROFILES: Dict[str, Dict[str, Any]] = {
+    "gpu-large": {      # largest GPU >= 11.5 GB (12 GB cards report a little under 12 GiB)
+        "min_vram_mb": 11500,
+        "roles": {
+            "coordinator": {"kind": "chat", "model": "qwen3-14b-q4_k_m", "port": 8001, "ctx": 12288, "parallel": 2,
+                            "kv": "q4_0", "batch": (2048, 1024), "vram_mb": 8400, "fallback": None},
+            "worker": {"kind": "chat", "model": "qwen2.5-coder-3b-q5_k_m", "port": 8002, "ctx": 8192, "parallel": 2,
+                       "kv": "q8_0", "batch": (2048, 512), "vram_mb": 2350, "fallback": "omit"},
+            "embedder": {"kind": "embedding", "model": "bge-large-en-v1.5-f16", "port": 8003, "ctx": 512,
+                         "vram_mb": 600, "fallback": "cpu"},
+        },
+    },
+    "gpu-small": {      # 7.5 to 11.5 GB: one 8B chat model, nothing else competing for the card
+        "min_vram_mb": 7500,
+        "roles": {
+            "coordinator": {"kind": "chat", "model": "qwen3-8b-q4_k_m", "port": 8001, "ctx": 8192, "parallel": 1,
+                            "kv": "q8_0", "batch": (2048, 512), "vram_mb": 6300, "fallback": None},
+            "embedder": {"kind": "embedding", "model": "bge-large-en-v1.5-f16", "port": 8003, "ctx": 512,
+                         "vram_mb": 600, "fallback": "cpu"},
+        },
+    },
+    "cpu": {            # no usable GPU: a small mixture-of-experts model that decodes well on a CPU
+        "min_vram_mb": 0,
+        "roles": {
+            "coordinator": {"kind": "chat", "model": "granite-4.0-h-tiny-q4_k_m", "port": 8001, "ctx": 8192,
+                            "parallel": 1, "kv": "q8_0", "batch": (2048, 512), "vram_mb": 0, "fallback": None,
+                            "cpu_only": True},
+            "embedder": {"kind": "embedding", "model": "bge-large-en-v1.5-f16", "port": 8003, "ctx": 512,
+                         "vram_mb": 0, "fallback": None, "cpu_only": True},
+        },
+    },
+}
+# Optional (--vision): needs a GPU of its own with this much room left, else it is left out with a note.
+VISION_ROLE: Dict[str, Any] = {"kind": "vision", "model": "qwen2.5-vl-7b-q4_k_m", "mmproj": "qwen2.5-vl-7b-mmproj-f16",
+                               "port": 8004, "ctx": 4096, "parallel": 1, "vram_mb": 6500, "fallback": "omit"}
+ROLE_ORDER = ("coordinator", "vision", "worker", "embedder")     # placement order: biggest first
+VRAM_MARGIN = 0.95          # never plan to fill a card
+BUILD_SPACE_MB = 3000       # llama.cpp source + build tree
+VULKAN_PACKAGES = ["libvulkan-dev", "vulkan-tools", "mesa-vulkan-drivers", "libdrm-dev", "glslc", "glslang-tools",
+                   "spirv-tools", "spirv-headers", "libspirv-tools-dev"]
+BASE_PACKAGES = ["build-essential", "cmake", "git", "curl", "ca-certificates", "python3", "pkg-config"]
+SPIRV_CMAKE_DIRS = ["/usr/local/share/cmake/SPIRV-Headers", "/usr/share/cmake/SPIRV-Headers"]
+VENDORS = {0x1002: "amd", 0x10DE: "nvidia", 0x8086: "intel"}
+
+
+class InstallerError(Exception):
+    """Something the installer cannot (or must not) go on with; the message says what to do about it."""
+
+
+# ------------------------------------------------------------------------------------------------------ parsers ----
+def parse_os_release(text: Optional[str]) -> Dict[str, str]:
+    out = {"id": UNKNOWN, "version_id": UNKNOWN, "pretty_name": UNKNOWN}
+    for line in (text or "").splitlines():
+        key, sep, val = line.partition("=")
+        key = key.strip().lower()
+        if sep and key in out:
+            out[key] = val.strip().strip('"').strip("'") or UNKNOWN
+    out["id"] = out["id"].lower()
+    return out
+
+
+def parse_meminfo(text: Optional[str]) -> Optional[int]:
+    """MemTotal in MB, or None."""
+    m = re.search(r"^MemTotal:\s+(\d+)\s*kB", text or "", re.M)
+    return int(m.group(1)) // 1024 if m else None
+
+
+_GPU_HEAD = re.compile(r"^\s*GPU(?:\s+id\s*:)?\s*(\d+)\s*(?:\((.*)\))?\s*:\s*$")
+
+
+def parse_vulkaninfo_summary(text: Optional[str]) -> List[Dict[str, Any]]:
+    """Every Vulkan device `vulkaninfo --summary` lists, in its order (that order is what GGML_VK_VISIBLE_DEVICES indexes):
+    {index, name, vendor_id, device_id, type (discrete | integrated | virtual | cpu | other), driver}."""
+    devices: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+    for line in (text or "").splitlines():
+        if line.strip().startswith("Device Groups"):
+            break
+        head = _GPU_HEAD.match(line)
+        if head:
+            cur = {"index": int(head.group(1)), "name": (head.group(2) or "").strip(), "vendor_id": None,
+                   "device_id": None, "type": "other", "driver": ""}
+            devices.append(cur)
+            continue
+        key, sep, val = line.partition("=")
+        if cur is None or not sep:
+            continue
+        key, val = key.strip(), val.strip()
+        if key in ("vendorID", "deviceID"):
+            try:
+                cur["vendor_id" if key == "vendorID" else "device_id"] = int(val, 16)
+            except ValueError:
+                pass
+        elif key == "deviceType":
+            m = re.search(r"PHYSICAL_DEVICE_TYPE_([A-Z]+)", val)
+            cur["type"] = (m.group(1).lower() if m else "other")
+        elif key == "deviceName" and val:
+            cur["name"] = val
+        elif key == "driverName":
+            cur["driver"] = val
+    return devices
+
+
+def parse_nvidia_smi(text: Optional[str]) -> List[Dict[str, Any]]:
+    """`nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits` -> [{name, vram_mb}]."""
+    out = []
+    for line in (text or "").splitlines():
+        name, sep, mem = line.rpartition(",")
+        if sep and mem.strip().isdigit() and name.strip():
+            out.append({"name": name.strip(), "vram_mb": int(mem.strip())})
+    return out
+
+
+def parse_llama_version(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    """`llama-server --version` -> {build, commit} or None."""
+    m = re.search(r"version:\s*(\d+)\s*\(([0-9a-fA-F]+)\)", text or "")
+    return {"build": int(m.group(1)), "commit": m.group(2).lower()} if m else None
+
+
+def _read_text(path: str) -> Optional[str]:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _run_text(argv: List[str], timeout: float = 15) -> Optional[str]:
+    """Output (stdout then stderr) of a read-only probe, or None when it is missing, fails to start or hangs."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return (done.stdout or "") + (done.stderr or "")
+
+
+def read_drm(root: str = "/sys/class/drm", read: Callable[[str], Optional[str]] = _read_text,
+             listdir: Callable[[str], List[str]] = os.listdir) -> List[Dict[str, Any]]:
+    """amdgpu (and any driver that publishes it) tells its VRAM in sysfs: [{vendor_id, device_id, vram_mb}] per card."""
+    out = []
+    try:
+        names = sorted(n for n in listdir(root) if re.fullmatch(r"card\d+", n))
+    except OSError:
+        return out
+    for n in names:
+        base = os.path.join(root, n, "device")
+        vendor, device, vram = (read(os.path.join(base, f)) for f in ("vendor", "device", "mem_info_vram_total"))
+        try:
+            out.append({"vendor_id": int((vendor or "").strip(), 16), "device_id": int((device or "").strip(), 16),
+                        "vram_mb": int((vram or "").strip()) // (1024 * 1024)})
+        except ValueError:
+            continue
+    return out
+
+
+def merge_gpus(vulkan: List[Dict[str, Any]], drm: List[Dict[str, Any]], nvidia: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Real GPUs (the software renderer is dropped) with their VRAM, from sysfs (matched on vendor and device id, so two
+    identical cards pair up in order) or, for NVIDIA's proprietary driver, from nvidia-smi (in order). vram_mb None = unknown."""
+    drm_left, smi_left = list(drm), list(nvidia)
+    gpus = []
+    for dev in vulkan:
+        if dev["type"] == "cpu":
+            continue
+        vram, source = None, UNKNOWN
+        hit = next((d for d in drm_left if d["vendor_id"] == dev["vendor_id"] and d["device_id"] == dev["device_id"]), None)
+        if hit is not None:
+            drm_left.remove(hit)
+            vram, source = hit["vram_mb"], "sysfs"
+        elif dev["vendor_id"] == 0x10DE and smi_left:
+            vram, source = smi_left.pop(0)["vram_mb"], "nvidia-smi"
+        gpus.append({"index": dev["index"], "name": dev["name"] or UNKNOWN, "vendor": VENDORS.get(dev["vendor_id"], UNKNOWN),
+                     "type": dev["type"], "driver": dev["driver"], "vram_mb": vram, "vram_source": source,
+                     "integrated": dev["type"] == "integrated"})
+    return gpus
+
+
+# --------------------------------------------------------------------------------------------------- detection ----
+def gather(prefix: str = DEFAULT_PREFIX, config_path: str = "", *, read: Callable[[str], Optional[str]] = _read_text,
+           run: Callable[[List[str]], Optional[str]] = _run_text, which: Callable[[str], Optional[str]] = shutil.which,
+           drm: Callable[[], List[Dict[str, Any]]] = read_drm) -> Dict[str, Any]:
+    """The raw facts of this machine, as text. Read-only. Everything a probe cannot get is None."""
+    llama = next((p for p in (os.path.join(prefix, "bin", "llama-server"), which("llama-server")) if p and os.path.isfile(p)), None)
+    config: Any = None
+    if config_path:
+        text = read(config_path)
+        if text is not None:
+            try:
+                config = json.loads(text.lstrip("﻿"))
+            except ValueError:
+                config = "invalid"
+    free = None
+    probe = prefix
+    while probe and not os.path.exists(probe) and os.path.dirname(probe) != probe:
+        probe = os.path.dirname(probe)
+    try:
+        free = shutil.disk_usage(probe or "/").free // (1024 * 1024)
+    except OSError:
+        pass
+    return {
+        "system": platform.system(), "machine": platform.machine(), "cpu_count": os.cpu_count(),
+        "euid": os.geteuid() if hasattr(os, "geteuid") else None,
+        "os_release": read("/etc/os-release"), "meminfo": read("/proc/meminfo"),
+        "vulkaninfo": run(["vulkaninfo", "--summary"]) if which("vulkaninfo") else None,
+        "nvidia_smi": run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        if which("nvidia-smi") else None,
+        "drm": drm(), "llama_server_path": llama,
+        "llama_server_version": run([llama, "--version"]) if llama else None,
+        "disk_free_mb": free, "config": config,
+    }
+
+
+def detect(sources: Optional[Dict[str, Any]] = None, prefix: str = DEFAULT_PREFIX, config_path: str = "") -> Dict[str, Any]:
+    """The machine as one dict. `sources` is what gather() returns (tests pass fixture text); None = look at this machine.
+    A fact that cannot be found is "unknown" (words) or None (numbers), never an exception."""
+    s = sources if sources is not None else gather(prefix, config_path)
+    osr = parse_os_release(s.get("os_release"))
+    vulkan_text = s.get("vulkaninfo")
+    gpus = merge_gpus(parse_vulkaninfo_summary(vulkan_text), s.get("drm") or [], parse_nvidia_smi(s.get("nvidia_smi")))
+    version = parse_llama_version(s.get("llama_server_version"))
+    system = s.get("system") or UNKNOWN
+    return {
+        "system": system, "is_linux": system == "Linux", "machine": s.get("machine") or UNKNOWN,
+        "os": {"id": osr["id"], "version_id": osr["version_id"], "pretty": osr["pretty_name"]},
+        "cpu_count": s.get("cpu_count"), "ram_mb": parse_meminfo(s.get("meminfo")),
+        "euid": s.get("euid"), "is_root": (s.get("euid") == 0) if s.get("euid") is not None else None,
+        "vulkan": UNKNOWN if vulkan_text is None else ("ok" if gpus else "no-gpu"),
+        "gpus": gpus, "nvidia": parse_nvidia_smi(s.get("nvidia_smi")),
+        "llama_server": ({"path": s["llama_server_path"], **(version or {"build": None, "commit": None})}
+                         if s.get("llama_server_path") else None),
+        "disk_free_mb": s.get("disk_free_mb"), "config": s.get("config"),
+    }
+
+
+def describe(d: Dict[str, Any]) -> List[str]:
+    gpu = ["  GPU %d: %s, %s" % (g["index"], g["name"], ("%.1f GB" % (g["vram_mb"] / 1024)) if g["vram_mb"] else "VRAM unknown"
+                                 ) + (" (integrated)" if g["integrated"] else "") for g in d["gpus"]]
+    ls = d["llama_server"]
+    return ["machine:  %s %s, %s, %s" % (d["system"], d["machine"], d["os"]["pretty"],
+                                          ("root" if d["is_root"] else "not root") if d["is_root"] is not None else "root unknown"),
+            "cpu/ram:  %s threads, %s" % (d["cpu_count"] or UNKNOWN, ("%.1f GB" % (d["ram_mb"] / 1024)) if d["ram_mb"] else UNKNOWN),
+            "vulkan:   %s" % d["vulkan"]] + (gpu or ["  no GPU found"]) + [
+            "llama-server: %s" % (("%s (build %s)" % (ls["path"], ls["build"] or UNKNOWN)) if ls else "not installed")]
+
+
+# ---------------------------------------------------------------------------------------------- profile + layout ----
+def usable_gpus(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Discrete GPUs with a known VRAM size: the ones a profile can be chosen from. (An integrated GPU shares system
+    RAM, and a card whose VRAM cannot be read cannot be sized; --profile still lets a person force one.)"""
+    return [g for g in d["gpus"] if g["vram_mb"] and not g["integrated"]]
+
+
+def choose_profile(d: Dict[str, Any], requested: str = "auto") -> str:
+    if requested != "auto":
+        if requested not in PROFILES:
+            raise InstallerError("unknown profile %r (choose from auto, %s)" % (requested, ", ".join(PROFILES)))
+        return requested
+    best = max((g["vram_mb"] for g in usable_gpus(d)), default=0)
+    for name in ("gpu-large", "gpu-small"):
+        if best >= PROFILES[name]["min_vram_mb"]:
+            return name
+    return "cpu"
+
+
+def place_roles(profile: str, d: Dict[str, Any], vision: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """(roles, notes): each role = its table entry plus name, gpu (the Vulkan index it is pinned to, None = CPU) and
+    model files. Greedy by size: the coordinator takes the largest GPU, each later role the GPU with the most room left
+    (VRAM_MARGIN of each card is all that may be planned), else its fallback (CPU, or left out)."""
+    spec = {name: dict(r) for name, r in PROFILES[profile]["roles"].items()}
+    notes: List[str] = []
+    if vision:
+        if profile == "cpu":
+            notes.append("vision skipped: it needs a GPU")
+        else:
+            spec["vision"] = dict(VISION_ROLE)
+    gpus = usable_gpus(d)
+    if not gpus and profile != "cpu":      # forced profile on a card whose size is unknown: trust the person, assume the tier
+        gpus = [dict(g, vram_mb=PROFILES[profile]["min_vram_mb"]) for g in d["gpus"] if g["type"] != "cpu"]
+        if not gpus:
+            raise InstallerError("profile %s needs a Vulkan GPU and none was found (is vulkan-tools installed and the "
+                                 "driver loaded? use --profile cpu to run without one)" % profile)
+    free = {g["index"]: g["vram_mb"] * VRAM_MARGIN for g in gpus}
+    roles = []
+    for name in ROLE_ORDER:
+        if name not in spec:
+            continue
+        r = dict(spec[name], name=name, gpu=None)
+        if not r.get("cpu_only"):
+            fits = [i for i in free if free[i] >= r["vram_mb"]]
+            if fits:
+                r["gpu"] = max(fits, key=lambda i: free[i])
+                free[r["gpu"]] -= r["vram_mb"]
+            elif r["fallback"] is None:
+                big = max((g["vram_mb"] for g in gpus), default=0)
+                raise InstallerError("the %s needs about %.1f GB of VRAM and the largest GPU has %.1f GB: use --profile %s"
+                                     % (name, r["vram_mb"] / 1024, big / 1024, "gpu-small" if profile == "gpu-large" else "cpu"))
+            elif r["fallback"] == "omit":
+                notes.append("%s left out: no GPU has %.1f GB free" % (name, r["vram_mb"] / 1024))
+                continue
+            else:
+                notes.append("%s runs on the CPU: no GPU has %.1f GB free" % (name, r["vram_mb"] / 1024))
+        roles.append(r)
+    for r in roles:
+        r["files"] = [MODELS[r["model"]]] + ([MODELS[r["mmproj"]]] if r.get("mmproj") else [])
+    return roles, notes
+
+
+# -------------------------------------------------------------------------------------------------- unit files ----
+def cpu_threads(d: Dict[str, Any]) -> int:
+    return max(1, min(d.get("cpu_count") or 4, 8))      # past ~8 threads decoding gets slower, not faster
+
+
+def engine_argv(role: Dict[str, Any], prefix: str, threads: int, *, backend: str = "vulkan", host: str = ENGINE_HOST,
+                binary: bool = True, models_dir: Optional[str] = None) -> List[str]:
+    """llama-server's command line for one role (the rules are in the module docstring). Defaults give the systemd unit's
+    line; the Docker stack passes binary=False (the image's entrypoint is llama-server), host="0.0.0.0" (reachable by the
+    other containers only: nothing is published), models_dir="/models" and backend "cuda" for NVIDIA ("CUDA0")."""
+    mdir = models_dir or prefix + "/models"
+    a = [prefix + "/bin/llama-server"] if binary else []
+    a += ["--model", "%s/%s" % (mdir, role["files"][0]["file"])]
+    if role.get("mmproj"):
+        a += ["--mmproj", "%s/%s" % (mdir, role["files"][1]["file"])]
+    a += ["--host", host, "--port", str(role["port"])]
+    if role["gpu"] is None:
+        a += ["--device", "none", "-t", str(2 if role["kind"] == "embedding" else threads)]
+    else:
+        a += ["--device", "CUDA0" if backend == "cuda" else "Vulkan0", "-ngl", "99"]
+    if role["kind"] == "embedding":
+        a += ["--embedding", "-c", str(role["ctx"]), "-b", str(role["ctx"]), "-ub", str(role["ctx"])]
+    else:
+        a += ["-c", str(role["ctx"]), "-np", str(role["parallel"])]
+        if role["kind"] == "chat":
+            a += ["-b", str(role["batch"][0]), "-ub", str(role["batch"][1]), "--flash-attn", "on",
+                  "-ctk", role["kv"], "-ctv", role["kv"], "--jinja"]
+    a += ["--alias", role["name"], "--metrics"]
+    if role["kind"] != "embedding":
+        a += ["--slots", "--props"]
+    return a
+
+
+def unit_name(role: str) -> str:
+    return "lodestone-%s.service" % role
+
+
+def _wrap(argv: List[str]) -> str:
+    """argv as a systemd ExecStart: one flag with its value per line, continued with a backslash."""
+    lines: List[List[str]] = [[argv[0]]]
+    for tok in argv[1:]:
+        if tok.startswith("-"):
+            lines.append([tok])
+        else:
+            lines[-1].append(tok)
+    return " \\\n    ".join(" ".join(x) for x in lines)
+
+
+def render_engine_unit(role: Dict[str, Any], prefix: str, threads: int, gpu_count: int) -> str:
+    model = role["files"][0]["file"]
+    env = ""
+    pre = ""
+    if role["gpu"] is not None:
+        env = 'Environment="GGML_VK_VISIBLE_DEVICES=%d"\n' % role["gpu"]
+        pre = "ExecStartPre=%s/bin/wait-for-gpus.sh %d\n" % (prefix, gpu_count)
+    where = "CPU" if role["gpu"] is None else "Vulkan GPU %d" % role["gpu"]
+    return (
+        "[Unit]\n"
+        "Description=Lodestone %s (%s, %s)\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "User=%s\n"
+        "Group=%s\n"
+        "WorkingDirectory=%s/models\n"
+        "%s"
+        "TimeoutStartSec=150\n"
+        "%s"
+        "ExecStart=%s\n"
+        "Restart=always\n"
+        "RestartSec=5\n"
+        "NoNewPrivileges=true\n"
+        "ProtectHome=true\n"
+        "LimitNOFILE=65535\n"
+        "StandardOutput=journal\n"
+        "StandardError=journal\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    ) % (role["name"], model, where, SERVICE_USER, SERVICE_USER, prefix, env, pre,
+         _wrap(engine_argv(role, prefix, threads)))
+
+
+def render_gateway_unit(prefix: str, config_path: str, engine_units: List[str]) -> str:
+    return (
+        "[Unit]\n"
+        "Description=Lodestone gateway (one OpenAI-compatible address in front of the engines)\n"
+        "After=network.target %s\n"
+        "Wants=%s\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "User=%s\n"
+        "Group=%s\n"
+        "WorkingDirectory=%s\n"
+        'Environment="PYTHONPATH=%s/app"\n'
+        'Environment="STONESAGE_CONFIG_FILE=%s"\n'
+        "ExecStart=/usr/bin/python3 -m lodestone.gateway\n"
+        "Restart=always\n"
+        "RestartSec=5\n"
+        "NoNewPrivileges=true\n"
+        "ProtectHome=true\n"
+        "StandardOutput=journal\n"
+        "StandardError=journal\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    ) % (" ".join(engine_units), " ".join(engine_units), SERVICE_USER, SERVICE_USER, prefix, prefix, config_path)
+
+
+WAIT_FOR_GPUS = """#!/bin/sh
+# ExecStartPre of Lodestone's GPU engines. At boot an engine can start before the GPU driver has brought every card up;
+# llama-server then finds fewer Vulkan devices than it was pinned to and silently runs on the CPU (a 14B model at
+# under 1 token/s, /health still 200). Waits until `vulkaninfo` lists at least $1 GPUs (default 1), up to 90 s.
+want=${1:-1}
+i=0
+have=0
+while [ "$i" -lt 90 ]; do
+  have=$(vulkaninfo --summary 2>/dev/null | grep -c 'deviceType *= *PHYSICAL_DEVICE_TYPE_\\(DISCRETE\\|INTEGRATED\\|VIRTUAL\\)_GPU')
+  [ "$have" -ge "$want" ] && exit 0
+  i=$((i + 1))
+  sleep 1
+done
+echo "wait-for-gpus: Vulkan lists $have of $want GPUs after 90 s" >&2
+exit 1
+"""
+
+
+# ------------------------------------------------------------------------------------------------------ config ----
+def merge_config(existing: Dict[str, Any], updates: Dict[str, Any],
+                 overwrite: Tuple[str, ...] = ()) -> Tuple[Dict[str, Any], List[str], List[str]]:
+    """existing + updates, as (merged, added, kept). Nothing in `existing` is ever dropped. A key that is already set
+    (not null, not "") is kept, not replaced, unless its dotted path is in `overwrite`; `kept` lists the dotted paths of
+    wanted values that were left as they were because the person had set something else."""
+    added: List[str] = []
+    kept: List[str] = []
+
+    def walk(base: Dict[str, Any], new: Dict[str, Any], path: str) -> Dict[str, Any]:
+        out = dict(base)
+        for key, val in new.items():
+            here = path + key
+            cur = out.get(key)
+            if isinstance(val, dict) and isinstance(cur, dict) and here not in overwrite:
+                out[key] = walk(cur, val, here + ".")
+            elif cur in (None, "") or here in overwrite:
+                if cur != val:
+                    added.append(here)
+                out[key] = val
+            elif cur != val:
+                kept.append(here)
+        return out
+
+    return walk(existing, updates, ""), added, kept
+
+
+def render_config(merged: Dict[str, Any]) -> str:
+    return json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
+
+
+# ---------------------------------------------------------------------------------------------------------- plan ----
+def _check(cid: str, ok: bool, message: str, fatal: bool = True) -> Dict[str, Any]:
+    return {"id": cid, "ok": bool(ok), "fatal": fatal, "message": message}
+
+
+def _safe_path(label: str, value: str) -> str:
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]*", value or "") or ".." in value.split("/"):
+        raise InstallerError("%s must be an absolute path of letters, digits and _ . / - only (got %r)" % (label, value))
+    if value.startswith(("/home/", "/root/")) or value in ("/home", "/root"):
+        raise InstallerError("%s must not be under /home or /root: the services run with ProtectHome and could not read it"
+                             % label)
+    return value.rstrip("/") or "/"
+
+
+def preflight_checks(d: Dict[str, Any], roles: List[Dict[str, Any]], notes: List[str], prefix: str) -> List[Dict[str, Any]]:
+    need_mb = BUILD_SPACE_MB + sum(f["size_bytes"] for r in roles for f in r["files"]) // (1024 * 1024)
+    osd = d["os"]
+    checks = [
+        _check("linux", d["is_linux"], "runs on Linux (this is %s)" % d["system"]),
+        _check("root", d["is_root"] is True, "run as root (sudo): it installs packages and systemd units"
+               + ("" if d["is_root"] is not None else " (cannot tell here)")),
+    ]
+    if osd["id"] == "ubuntu" and osd["version_id"] == "24.04":
+        checks.append(_check("os", True, "Ubuntu 24.04, the tested target"))
+    elif osd["id"] in ("ubuntu", "debian"):
+        checks.append(_check("os", False, "%s is not the tested Ubuntu 24.04: package names may differ" % osd["pretty"], False))
+    elif osd["id"] == UNKNOWN:
+        checks.append(_check("os", False, "operating system not recognised (no /etc/os-release); apt is required", False))
+    else:
+        checks.append(_check("os", False, "%s: only apt-based systems (Ubuntu 24.04) are supported" % osd["pretty"]))
+    if d["machine"] not in ("x86_64", "aarch64", "amd64", "arm64"):
+        checks.append(_check("arch", False, "CPU architecture %s is untested" % d["machine"], False))
+    if d["ram_mb"] is not None and d["ram_mb"] < 8000:
+        checks.append(_check("ram", False, "%.1f GB of RAM: building llama.cpp and loading a model may run out" % (d["ram_mb"] / 1024), False))
+    if d["disk_free_mb"] is None:
+        checks.append(_check("disk", False, "free disk space under %s unknown; about %.0f GB are needed" % (prefix, need_mb / 1024), False))
+    else:
+        checks.append(_check("disk", d["disk_free_mb"] >= need_mb, "%.0f GB free under %s, about %.0f GB needed"
+                             % (d["disk_free_mb"] / 1024, prefix, need_mb / 1024)))
+    checks += [_check("note", False, n, False) for n in notes]
+    return checks
+
+
+def plan(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """The whole install as an ordered list of steps; nothing is run or written here.
+    A step: {"id", "why"} plus any of "commands" (argv lists, run in order), "files" (path -> content, written before the
+    commands) and "modes" (path -> chmod), "checks" (preflight), "skip_if" (the step is done already when ALL of its
+    conditions hold: exists, any_exists, file_contains [path, text], file_size [path, bytes]), "env" (added to the
+    commands' environment), "secret" (print a summary, not the content of its files), "summary"."""
+    c = choices or {}
+    prefix = _safe_path("--prefix", c.get("prefix") or DEFAULT_PREFIX)
+    config_path = _safe_path("--config", c.get("config") or prefix + "/config.json")
+    pkg_dir = c.get("package_dir") or os.path.dirname(os.path.abspath(__file__))
+    if d.get("config") == "invalid" or (d.get("config") is not None and not isinstance(d["config"], dict)):
+        raise InstallerError("%s exists but is not a JSON object: fix or move it, the installer will not overwrite it" % config_path)
+    profile = choose_profile(d, c.get("profile") or "auto")
+    roles, notes = place_roles(profile, d, bool(c.get("vision")))
+    threads = cpu_threads(d)
+    gpu_build = profile != "cpu"
+    gpu_count = len([g for g in d["gpus"] if g["type"] != "cpu"])
+    src, app, models = prefix + "/src/llama.cpp", prefix + "/app", prefix + "/models"
+    binary, marker = prefix + "/bin/llama-server", prefix + "/bin/llama-server.ref"
+    steps: List[Dict[str, Any]] = []
+
+    steps.append({"id": "preflight", "why": "refuse early, before anything is changed, on a machine this cannot work on",
+                  "checks": preflight_checks(d, roles, notes, prefix)})
+    packages = BASE_PACKAGES + (VULKAN_PACKAGES if gpu_build else [])
+    steps.append({"id": "apt-packages", "why": "compiler, cmake and git to build llama.cpp" + (
+        "; Vulkan headers, drivers and the shader compiler for the GPU build" if gpu_build else " (CPU build, no Vulkan)"),
+        "env": {"DEBIAN_FRONTEND": "noninteractive"},
+        "commands": [["apt-get", "update"], ["apt-get", "install", "-y"] + packages]})
+    if gpu_build:
+        steps.append({"id": "spirv-headers", "why": "llama.cpp's Vulkan build wants SPIRV-Headers' CMake config; some releases "
+                      "ship the headers without it, so build it from Khronos' repository when missing",
+                      "skip_if": {"any_exists": SPIRV_CMAKE_DIRS},
+                      "commands": [["git", "clone", "--depth", "1", "https://github.com/KhronosGroup/SPIRV-Headers.git", "/tmp/SPIRV-Headers"],
+                                   ["cmake", "-S", "/tmp/SPIRV-Headers", "-B", "/tmp/SPIRV-Headers/build"],
+                                   ["cmake", "--install", "/tmp/SPIRV-Headers/build"],
+                                   ["rm", "-rf", "/tmp/SPIRV-Headers"]]})
+    steps.append({"id": "service-user", "why": "the engines run as an unprivileged system user, which needs the render and "
+                  "video groups to open the GPU", "commands": [
+                      ["sh", "-c", "id -u %s >/dev/null 2>&1 || useradd --system --home-dir %s --no-create-home "
+                       "--shell /usr/sbin/nologin %s" % (SERVICE_USER, prefix, SERVICE_USER)],
+                      ["sh", "-c", "for g in render video; do getent group $g >/dev/null && usermod -aG $g %s; done; true" % SERVICE_USER],
+                      ["install", "-d", "-m", "755", prefix, prefix + "/bin", prefix + "/src", models],
+                  ]})
+    steps.append({"id": "llama-cpp-source", "why": "fetch llama.cpp at the pinned commit %s (not 'latest': a moved flag "
+                  "would break the units below)" % LLAMA_CPP_REF[:12],
+                  "skip_if": {"file_contains": [marker, LLAMA_CPP_REF], "exists": binary},
+                  "commands": [["sh", "-c", "test -d %s/.git || git clone %s %s" % (src, LLAMA_CPP_URL, src)],
+                               ["git", "-C", src, "checkout", "--detach", LLAMA_CPP_REF]]})
+    cmake = ["cmake", "-S", src, "-B", src + "/build", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF",
+             "-DLLAMA_CURL=OFF"] + (["-DGGML_VULKAN=ON"] if gpu_build else [])
+    steps.append({"id": "llama-cpp-build", "why": "build llama-server (%s) and install it as %s" % (
+        "Vulkan backend" if gpu_build else "CPU only", binary),
+        "skip_if": {"file_contains": [marker, LLAMA_CPP_REF], "exists": binary},
+        "commands": [cmake,
+                     ["cmake", "--build", src + "/build", "--config", "Release", "-j", str(max(1, d.get("cpu_count") or 2)),
+                      "--target", "llama-server"],
+                     ["install", "-m", "755", src + "/build/bin/llama-server", binary],
+                     ["sh", "-c", "echo %s > %s" % (LLAMA_CPP_REF, marker)]]})
+    steps.append({"id": "lodestone-code", "why": "copy this package to %s so the service user can run the gateway and "
+                  "the downloader whatever directory the installer was started from" % app,
+                  "commands": [["rm", "-rf", app + "/lodestone"], ["mkdir", "-p", app], ["cp", "-r", pkg_dir, app + "/lodestone"],
+                               ["chmod", "-R", "a+rX", app]]})
+    seen = set()
+    for r in roles:
+        for f in r["files"]:
+            if f["file"] in seen:
+                continue
+            seen.add(f["file"])
+            steps.append({"id": "model-" + f["file"], "why": "%s for the %s (%.1f GB, from huggingface.co/%s); SHA-256 goes to %s/SHA256SUMS"
+                          % (f["file"], r["name"], f["size_bytes"] / 1e9, f["repo"], models),
+                          "skip_if": {"file_size": [models + "/" + f["file"], f["size_bytes"]]}, "env": {"PYTHONPATH": app},
+                          "commands": [["python3", "-m", "lodestone.model_downloader", "--repo", f["repo"], "--file", f["file"],
+                                        "--dest", models]]})
+    files: Dict[str, str] = {}
+    modes: Dict[str, int] = {}
+    if gpu_build:
+        files[prefix + "/bin/wait-for-gpus.sh"] = WAIT_FOR_GPUS
+        modes[prefix + "/bin/wait-for-gpus.sh"] = 0o755
+    for r in roles:
+        files["/etc/systemd/system/" + unit_name(r["name"])] = render_engine_unit(r, prefix, threads, gpu_count)
+    engine_units = [unit_name(r["name"]) for r in roles]
+    files["/etc/systemd/system/lodestone-gateway.service"] = render_gateway_unit(prefix, config_path, engine_units)
+    steps.append({"id": "systemd-units", "why": "one unit per engine (pinned GPU, 127.0.0.1 only, restarts on failure) and one "
+                  "for the gateway", "files": files, "modes": modes})
+
+    updates: Dict[str, Any] = {"cluster": {"%s_url" % r["name"]: "http://%s:%d/v1" % (ENGINE_HOST, r["port"]) for r in roles},
+                               "gateway": {"host": ENGINE_HOST, "port": GATEWAY_PORT},
+                               "lodestone": {"install": {"profile": profile, "prefix": prefix, "llama_cpp_ref": LLAMA_CPP_REF}}}
+    merged, added, kept = merge_config(d.get("config") or {}, updates, overwrite=("lodestone.install",))
+    steps.append({"id": "config", "why": "tell the gateway and everything above it where the engines are (%s); existing keys are "
+                  "kept, the old file is backed up first" % config_path,
+                  "files": {config_path: render_config(merged)}, "modes": {config_path: 0o640}, "secret": True,
+                  "summary": {"added": added, "kept": kept}, "commands": [["chgrp", SERVICE_USER, config_path]]})
+    gateway_health = "http://%s:%d/health" % (ENGINE_HOST, GATEWAY_PORT)
+    steps.append({"id": "start", "why": "start the engines, then the gateway, and wait until each answers /health (a large "
+                  "model takes a minute or two to load)", "commands": [["systemctl", "daemon-reload"],
+                  ["systemctl", "enable", "--now"] + engine_units, ["systemctl", "enable", "--now", "lodestone-gateway.service"]] + [
+                      ["sh", "-c", "for i in $(seq 1 90); do curl -fsS http://%s:%d/health >/dev/null && exit 0; sleep 2; done; "
+                       "echo \"%s did not answer /health in 3 minutes: journalctl -u %s\" >&2; exit 1"
+                       % (ENGINE_HOST, r["port"], r["name"], unit_name(r["name"]))] for r in roles] + [
+                      ["sh", "-c", "for i in $(seq 1 30); do curl -fsS %s >/dev/null && exit 0; sleep 1; done; exit 1" % gateway_health]]})
+    return steps
+
+
+# ---------------------------------------------------------------------------------------------------------- apply ----
+def _skip(cond: Dict[str, Any], read: Callable[[str], Optional[str]] = _read_text) -> bool:
+    """True when every condition of a step's skip_if holds (so the step was done on an earlier run)."""
+    for kind, arg in cond.items():
+        if kind == "exists":
+            ok = os.path.exists(arg)
+        elif kind == "any_exists":
+            ok = any(os.path.exists(p) for p in arg)
+        elif kind == "file_contains":
+            ok = arg[1] in (read(arg[0]) or "")
+        elif kind == "file_size":
+            try:
+                ok = os.path.getsize(arg[0]) == arg[1]
+            except OSError:
+                ok = False
+        else:
+            ok = False
+        if not ok:
+            return False
+    return bool(cond)
+
+
+def _run_cmd(argv: List[str], env: Optional[Dict[str, str]] = None) -> int:
+    try:
+        return subprocess.run(argv, env=env).returncode
+    except OSError as e:
+        print("  cannot start %s: %s" % (argv[0], e), file=sys.stderr)
+        return 127
+
+
+def write_file(path: str, content: str, mode: Optional[int], stamp: str) -> str:
+    """Write content to path (LF line endings, atomic). An existing different file is copied to <path>.bak-<stamp> first;
+    an identical one is left alone. Returns "unchanged" | "written" | "backed up and written"."""
+    old = None
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            old = f.read()
+        if old == content:
+            return "unchanged"
+        shutil.copy2(path, "%s.bak-%s" % (path, stamp))
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    return "backed up and written" if old is not None else "written"
+
+
+def show(steps: List[Dict[str, Any]], out: Callable[[str], None] = print) -> None:
+    """The dry run: every step's why and what it would run or write. Executes nothing."""
+    for n, s in enumerate(steps, 1):
+        out("\n[%d/%d] %s: %s" % (n, len(steps), s["id"], s["why"]))
+        for c in s.get("checks", []):
+            out("    %s %s" % ("ok  " if c["ok"] else ("FAIL" if c["fatal"] else "warn"), c["message"]))
+        if s.get("skip_if"):
+            out("    (skipped when already done: %s)" % json.dumps(s["skip_if"]))
+        for argv in s.get("commands", []):
+            out("    $ " + shlex.join(argv))
+        for path, content in s.get("files", {}).items():
+            if s.get("secret"):
+                sm = s.get("summary", {})
+                out("    write %s (existing keys kept; added: %s; left as set: %s)"
+                    % (path, ", ".join(sm.get("added", [])) or "nothing", ", ".join(sm.get("kept", [])) or "nothing"))
+            else:
+                out("    write %s" % path)
+                for line in content.splitlines():
+                    out("    | " + line)
+
+
+def apply(steps: List[Dict[str, Any]], dry_run: bool = True, *, system: Optional[str] = None, euid: Optional[int] = None,
+          run: Callable[..., int] = _run_cmd, out: Callable[[str], None] = print,
+          now: Callable[[], str] = lambda: time.strftime("%Y%m%d-%H%M%S")) -> List[Tuple[str, str]]:
+    """Dry run (the default): print the steps. dry_run=False: execute them, in order, and stop at the first failure with
+    an InstallerError that names the step and the command. Refuses to execute off Linux or without root. Returns
+    [(step id, "done" | "skipped")]."""
+    if dry_run:
+        show(steps, out)
+        return []
+    system = system if system is not None else platform.system()
+    euid = euid if euid is not None else (os.geteuid() if hasattr(os, "geteuid") else None)
+    if system != "Linux":
+        raise InstallerError("--apply only runs on Linux (this is %s): the installer targets Ubuntu 24.04. Without --apply it "
+                             "prints the plan." % system)
+    if euid != 0:
+        raise InstallerError("--apply must run as root (try: sudo python3 -m lodestone.installer --apply)")
+    results: List[Tuple[str, str]] = []
+    stamp = now()
+    for n, s in enumerate(steps, 1):
+        out("[%d/%d] %s: %s" % (n, len(steps), s["id"], s["why"]))
+        for c in s.get("checks", []):
+            if not c["ok"]:
+                out("    %s %s" % ("FAIL" if c["fatal"] else "warn", c["message"]))
+        bad = [c for c in s.get("checks", []) if c["fatal"] and not c["ok"]]
+        if bad:
+            raise InstallerError("step %s: %s" % (s["id"], "; ".join(c["message"] for c in bad)))
+        if s.get("skip_if") and _skip(s["skip_if"]):
+            out("    already done, skipped")
+            results.append((s["id"], "skipped"))
+            continue
+        for path, content in s.get("files", {}).items():
+            try:
+                out("    %s: %s" % (path, write_file(path, content, s.get("modes", {}).get(path), stamp)))
+            except OSError as e:
+                raise InstallerError("step %s: cannot write %s: %s" % (s["id"], path, e))
+        env = dict(os.environ, **s["env"]) if s.get("env") else None
+        for argv in s.get("commands", []):
+            out("    $ " + shlex.join(argv))
+            code = run(argv, env=env)
+            if code != 0:
+                raise InstallerError("step %s failed: `%s` exited with %s. Fix that and run the installer again: finished "
+                                     "steps are skipped." % (s["id"], shlex.join(argv), code))
+        results.append((s["id"], "done"))
+    out("\nDone. The gateway answers on http://%s:%d/v1 (set gateway.api_key in the config before exposing it)."
+        % (ENGINE_HOST, GATEWAY_PORT))
+    return results
+
+
+# ----------------------------------------------------------------------------------------------------- docker ----
+# The same plan as a Docker Compose stack (`--docker`): for people on any OS that runs Docker, instead of the bare-metal
+# steps above. Engines run in llama.cpp's own published server images; the models come from one named volume that a
+# one-shot service fills with model_downloader; the gateway (and, unless --no-stonesage, StoneSage with Hearth) point at the
+# engines by service name. Nothing is published except the gateway and the cockpit, both on 127.0.0.1 unless .env says
+# otherwise. Support: CPU runs anywhere (Linux, Windows, macOS incl. Apple Silicon: the images are multi-arch); NVIDIA via the
+# cuda image on Linux and on Windows Docker Desktop (WSL2); AMD and Intel GPUs via /dev/dri (Vulkan) on Linux only.
+
+# llama.cpp's published images, ONE build for all three variants. LLAMA_CPP_REF (the commit the native units are verified on,
+# 2026-09-04) has no image of its own (images exist for some builds only); b10818 is the nearest build that has all of
+# server-vulkan, server-cuda and server (multi-arch: amd64 + arm64): it is that commit plus six commits that touch only OpenCL,
+# Metal, SYCL and the web UI. To change it: edit LLAMA_CPP_IMAGE_BUILD, or set LLAMA_CPP_IMAGE in the generated .env
+# (any ghcr.io/ggml-org/llama.cpp tag from https://github.com/ggml-org/llama.cpp/pkgs/container/llama.cpp), after checking the
+# flags in the module docstring still exist in that build.
+LLAMA_CPP_IMAGE = "ghcr.io/ggml-org/llama.cpp"
+LLAMA_CPP_IMAGE_BUILD = "b10818"
+LLAMA_CPP_IMAGE_VARIANT = {"vulkan": "server-vulkan", "cuda": "server-cuda", "cpu": "server"}
+GATEWAY_IMAGE = "ghcr.io/lottage/lodestone:latest"          # built from the gateway Dockerfile (StoneSage/docker/)
+STONESAGE_IMAGE = "ghcr.io/lottage/hearth:latest"           # StoneSage + the Hearth app; ghcr.io/lottage/stonesage = without
+GPU_KINDS = ("vulkan", "cuda", "cpu")
+MODELS_MOUNT = "/models"
+GATEWAY_CONTAINER_PORT = 8000
+STONESAGE_CONTAINER_PORT = 8888
+# the environment variables lodestone.endpoints reads (a test checks they agree; this file imports nothing from the package)
+ENGINE_ROLE_ENV = {"coordinator": "COORDINATOR_URL", "worker": "WORKER_URL", "embedder": "EMBEDDER_URL", "vision": "VISION_URL"}
+
+
+def engine_image(kind: str) -> str:
+    return "%s:%s-%s" % (LLAMA_CPP_IMAGE, LLAMA_CPP_IMAGE_VARIANT[kind], LLAMA_CPP_IMAGE_BUILD)
+
+
+def _gpu_row(index: int, name: str, vendor: str, vram_mb: Optional[int], source: str) -> Dict[str, Any]:
+    return {"index": index, "name": name, "vendor": vendor, "type": "discrete", "driver": "", "vram_mb": vram_mb,
+            "vram_source": source, "integrated": False}
+
+
+def docker_gpus(d: Dict[str, Any], kind: str) -> List[Dict[str, Any]]:
+    """The GPUs a container of this kind could use, as detect() rows. cuda: NVIDIA cards, numbered as the container sees
+    them (0..n-1; from Vulkan when it lists them, else from nvidia-smi alone, which is all a Windows host has). vulkan:
+    every real Vulkan device, numbered as `vulkaninfo` lists them."""
+    real = [g for g in d["gpus"] if g["type"] != "cpu"]
+    if kind == "cuda":
+        nv = [g for g in real if g["vendor"] == "nvidia"]
+        if nv:
+            return [dict(g, index=i) for i, g in enumerate(nv)]
+        return [_gpu_row(i, s["name"], "nvidia", s["vram_mb"], "nvidia-smi") for i, s in enumerate(d.get("nvidia") or [])]
+    return real if kind == "vulkan" else []
+
+
+def choose_docker_gpu(d: Dict[str, Any], requested: str = "auto") -> Tuple[str, List[str]]:
+    """(kind, notes): vulkan | cuda | cpu. auto: NVIDIA only -> cuda; an AMD or Intel discrete GPU on Linux -> vulkan;
+    anything else -> cpu, which runs everywhere and is the safe default when no GPU is visible."""
+    if requested != "auto":
+        if requested not in GPU_KINDS:
+            raise InstallerError("unknown --gpu %r (choose from auto, %s)" % (requested, ", ".join(GPU_KINDS)))
+        return requested, []
+    notes: List[str] = []
+    nvidia = docker_gpus(d, "cuda")
+    others = [g for g in d["gpus"] if g["type"] != "cpu" and g["vendor"] != "nvidia" and not g["integrated"]]
+    if others and d.get("system") == "Linux":
+        return "vulkan", notes
+    if others:
+        notes.append("an AMD or Intel GPU was found, but Docker passes those through only on Linux (/dev/dri): using the CPU")
+    if nvidia and not others:
+        return "cuda", notes
+    if nvidia:
+        notes.append("an NVIDIA GPU was found next to the Vulkan one; --gpu cuda uses it")
+    return "cpu", notes
+
+
+def docker_stack(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The plan for a Compose stack: {"profile", "gpu" (kind), "roles", "notes", "threads", "stonesage"}. Reuses PROFILES,
+    place_roles and engine_argv; a GPU request that finds no GPU big enough (or none at all) becomes the CPU profile,
+    unless --profile names a GPU profile on purpose (then one card of that tier is assumed, as the native installer does)."""
+    c = choices or {}
+    requested_kind = c.get("gpu") or "auto"
+    requested_profile = c.get("profile") or "auto"
+    kind, notes = choose_docker_gpu(d, requested_kind)
+    if requested_profile not in ("auto",) + tuple(PROFILES):
+        raise InstallerError("unknown profile %r (choose from auto, %s)" % (requested_profile, ", ".join(PROFILES)))
+    if kind == "cpu" and requested_profile not in ("auto", "cpu"):
+        raise InstallerError("profile %s needs a GPU and --gpu is cpu (or no GPU Docker can use was found): use --profile cpu, "
+                             "or --gpu vulkan / --gpu cuda" % requested_profile)
+    view = dict(d, gpus=docker_gpus(d, kind))
+    if kind != "cpu" and not view["gpus"] and requested_profile in PROFILES and requested_profile != "cpu":
+        view["gpus"] = [_gpu_row(0, "GPU 0 (assumed)", "nvidia" if kind == "cuda" else UNKNOWN, None, UNKNOWN)]
+    profile = "cpu" if kind == "cpu" else choose_profile(view, requested_profile)
+    if profile == "cpu" and kind != "cpu":
+        notes.append("no %s GPU with enough memory was found: running on the CPU (pass --profile gpu-small or gpu-large to "
+                     "assume a GPU you know is there)" % kind)
+        kind = "cpu"
+    roles, role_notes = place_roles(profile, view, bool(c.get("vision")))
+    return {"profile": profile, "gpu": kind, "roles": roles, "notes": notes + role_notes, "threads": cpu_threads(d),
+            "stonesage": c.get("stonesage", True)}
+
+
+def _py_http_check(port: int, path: str) -> List[str]:
+    return ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%d%s', timeout=3)" % (port, path)]
+
+
+def compose_services(stack: Dict[str, Any]) -> Dict[str, Any]:
+    """The `services:` mapping, in start order (models, engines, gateway, stonesage)."""
+    roles, kind = stack["roles"], stack["gpu"]
+    svc: Dict[str, Any] = {}
+    fetch, seen = [], set()
+    for r in roles:
+        for f in r["files"]:
+            if f["file"] not in seen:
+                seen.add(f["file"])
+                fetch.append("python -m lodestone.model_downloader --repo %s --file %s --dest %s"
+                             % (shlex.quote(f["repo"]), shlex.quote(f["file"]), MODELS_MOUNT))
+    verify = 'cd %s && ( [ "$$LODESTONE_VERIFY_MODELS" != 1 ] || sha256sum -c SHA256SUMS )' % MODELS_MOUNT
+    svc["models"] = {
+        "image": "${LODESTONE_IMAGE:-%s}" % GATEWAY_IMAGE, "restart": "no",
+        "command": ["sh", "-c", " && ".join(fetch + [verify])],
+        "environment": {"LODESTONE_VERIFY_MODELS": "${LODESTONE_VERIFY_MODELS:-0}"},
+        "volumes": ["models:%s" % MODELS_MOUNT]}
+    for r in roles:
+        s: Dict[str, Any] = {
+            "image": "${LLAMA_CPP_IMAGE:-%s}" % engine_image(kind), "restart": "unless-stopped",
+            "command": engine_argv(r, "", stack["threads"], backend=kind, host="0.0.0.0", binary=False, models_dir=MODELS_MOUNT),
+            "volumes": ["models:%s:ro" % MODELS_MOUNT]}
+        if r["gpu"] is not None and kind == "vulkan":
+            s["environment"] = {"GGML_VK_VISIBLE_DEVICES": str(r["gpu"])}
+            s["devices"] = ["/dev/dri:/dev/dri"]
+            s["group_add"] = ["${VIDEO_GID:-44}", "${RENDER_GID:-992}"]
+        elif r["gpu"] is not None and kind == "cuda":
+            s["deploy"] = {"resources": {"reservations": {"devices": [
+                {"driver": "nvidia", "device_ids": [str(r["gpu"])], "capabilities": ["gpu"]}]}}}
+        s["healthcheck"] = {"test": ["CMD", "curl", "-f", "http://localhost:%d/health" % r["port"]], "interval": "15s",
+                            "timeout": "5s", "retries": 20, "start_period": "120s"}
+        s["depends_on"] = {"models": {"condition": "service_completed_successfully"}}
+        svc[r["name"]] = s
+    urls = {ENGINE_ROLE_ENV[r["name"]]: "http://%s:%d/v1" % (r["name"], r["port"]) for r in roles}
+    healthy = {r["name"]: {"condition": "service_healthy"} for r in roles}
+    svc["gateway"] = {
+        "image": "${LODESTONE_IMAGE:-%s}" % GATEWAY_IMAGE, "restart": "unless-stopped",
+        "command": ["python", "-m", "lodestone.gateway", "--host", "0.0.0.0", "--port", str(GATEWAY_CONTAINER_PORT)],
+        "environment": dict(urls, LODESTONE_API_KEY="${LODESTONE_API_KEY:-}"),
+        "ports": ["${LODESTONE_BIND:-127.0.0.1}:${GATEWAY_PORT:-%d}:%d" % (GATEWAY_CONTAINER_PORT, GATEWAY_CONTAINER_PORT)],
+        "healthcheck": {"test": _py_http_check(GATEWAY_CONTAINER_PORT, "/health"), "interval": "30s", "timeout": "5s",
+                        "retries": 5, "start_period": "20s"},
+        "depends_on": healthy}
+    if stack["stonesage"]:
+        svc["stonesage"] = {
+            "image": "${STONESAGE_IMAGE:-%s}" % STONESAGE_IMAGE, "restart": "unless-stopped",
+            "environment": dict(urls, STONESAGE_APPS="hearth", HASS_URL="${HASS_URL:-http://homeassistant.local:8123}",
+                                HASS_TOKEN="${HASS_TOKEN:-}", TZ="${TZ:-UTC}"),
+            "ports": ["${STONESAGE_BIND:-127.0.0.1}:${STONESAGE_PORT:-%d}:%d" % (STONESAGE_CONTAINER_PORT, STONESAGE_CONTAINER_PORT)],
+            "volumes": ["stonesage-config:/config", "stonesage-data:/data"],
+            "healthcheck": {"test": ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', %d), 3).close()"
+                                     % STONESAGE_CONTAINER_PORT], "interval": "30s", "timeout": "5s", "retries": 5,
+                            "start_period": "60s"},
+            "depends_on": {n: v for n, v in healthy.items() if n in ("coordinator", "embedder")}}
+    return svc
+
+
+def compose_dict(stack: Dict[str, Any]) -> Dict[str, Any]:
+    vols: Dict[str, Any] = {"models": {}}
+    if stack["stonesage"]:
+        vols.update({"stonesage-config": {}, "stonesage-data": {}})
+    return {"name": "lodestone", "services": compose_services(stack), "volumes": vols}
+
+
+# A small YAML writer for exactly the shapes compose_dict makes (mappings, lists, strings, ints, booleans): every string is
+# JSON-quoted, which YAML reads as a double-quoted scalar, so `${VAR:-x}` and shell commands need no escaping rules.
+def _yaml_scalar(v: Any) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    return json.dumps(str(v), ensure_ascii=False)
+
+
+def _yaml_lines(node: Any, indent: int) -> List[str]:
+    pad = "  " * indent
+    out: List[str] = []
+    if isinstance(node, dict):
+        for key, val in node.items():
+            if isinstance(val, dict) and val:
+                out += [pad + "%s:" % key] + _yaml_lines(val, indent + 1)
+            elif isinstance(val, dict):
+                out.append(pad + "%s: {}" % key)
+            elif isinstance(val, list) and (len(val) > 4 or any(isinstance(x, (dict, list)) for x in val)):
+                out += [pad + "%s:" % key] + _yaml_lines(val, indent + 1)
+            elif isinstance(val, list):
+                out.append(pad + "%s: [%s]" % (key, ", ".join(_yaml_scalar(x) for x in val)))
+            else:
+                out.append(pad + "%s: %s" % (key, _yaml_scalar(val)))
+    else:                                               # a list in block style
+        for item in node:
+            if isinstance(item, dict):
+                sub = _yaml_lines(item, indent + 1)
+                out += [pad + "- " + sub[0][len(pad) + 2:]] + sub[1:]
+            else:
+                out.append(pad + "- " + _yaml_scalar(item))
+    return out
+
+
+def render_compose(stack: Dict[str, Any]) -> str:
+    comp = compose_dict(stack)
+    kind = stack["gpu"]
+    why = {
+        "models": "one-shot: downloads the models into the shared volume (resumable; SHA-256 in SHA256SUMS), then exits",
+        "gateway": "the one address to use: an OpenAI-compatible API in front of the engines (http://localhost:8000/v1)",
+        "stonesage": "StoneSage with the Hearth app: the cockpit on http://localhost:8888; fill HASS_TOKEN in .env first",
+    }
+    for r in stack["roles"]:
+        where = ("the CPU" if r["gpu"] is None else "GPU %d" % r["gpu"])
+        why[r["name"]] = "%s engine (%s) on %s; reachable by the other services only" % (r["name"], r["files"][0]["file"], where)
+    head = [
+        "# Generated by `python -m lodestone.installer --docker` (profile %s, %s). Edit freely; re-generating writes a backup." % (
+            stack["profile"], {"vulkan": "AMD/Intel GPUs through /dev/dri (Linux)", "cuda": "NVIDIA GPUs (nvidia-container-toolkit)",
+                               "cpu": "CPU only"}[kind]),
+        "# Engines use llama.cpp's published images (%s); the tag is LLAMA_CPP_IMAGE in .env." % engine_image(kind),
+        "# Start:  docker compose up -d     Models are downloaded on the first start (several GB): docker compose logs -f models",
+        "# Secrets: none in this file; the API key and the Home Assistant token go in .env.",
+    ]
+    lines = head + ["name: %s" % _yaml_scalar(comp["name"]), "services:"]
+    for name, body in comp["services"].items():
+        lines += ["  # " + why[name], "  %s:" % name] + _yaml_lines(body, 2) + [""]
+    lines += ["volumes:"] + _yaml_lines(comp["volumes"], 1)
+    return "\n".join(lines) + "\n"
+
+
+def render_env(stack: Dict[str, Any]) -> str:
+    kind = stack["gpu"]
+    lines = [
+        "# Settings for docker-compose.yml. No secrets are generated here: the empty values below are yours to fill.",
+        "",
+        "# llama.cpp image for the engines (see the note on LLAMA_CPP_IMAGE_BUILD in lodestone/installer.py before changing it)",
+        "LLAMA_CPP_IMAGE=%s" % engine_image(kind),
+        "LODESTONE_IMAGE=%s" % GATEWAY_IMAGE,
+    ]
+    if stack["stonesage"]:
+        lines.append("STONESAGE_IMAGE=%s" % STONESAGE_IMAGE)
+    lines += [
+        "",
+        "# The gateway. Bound to this computer only; set LODESTONE_BIND=0.0.0.0 to offer it on your network AND set a key first.",
+        "LODESTONE_BIND=127.0.0.1",
+        "GATEWAY_PORT=%d" % GATEWAY_CONTAINER_PORT,
+        "LODESTONE_API_KEY=",
+        "",
+        "# Set to 1 to re-check every model file against its recorded SHA-256 each time the models service runs (slow for big files)",
+        "LODESTONE_VERIFY_MODELS=0",
+    ]
+    if stack["stonesage"]:
+        lines += [
+            "",
+            "# StoneSage and Hearth: the cockpit, and Home Assistant (Profile > Security > Long-lived access tokens)",
+            "STONESAGE_BIND=127.0.0.1",
+            "STONESAGE_PORT=%d" % STONESAGE_CONTAINER_PORT,
+            "HASS_URL=http://homeassistant.local:8123",
+            "HASS_TOKEN=",
+            "TZ=UTC",
+        ]
+    if kind == "vulkan":
+        lines += [
+            "",
+            "# Group ids of /dev/dri on this computer (`getent group video render`); only needed if the container user is not root",
+            "VIDEO_GID=44",
+            "RENDER_GID=992",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def docker_files(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """({"docker-compose.yml": text, ".env": text}, stack)."""
+    stack = docker_stack(d, choices)
+    return {"docker-compose.yml": render_compose(stack), ".env": render_env(stack)}, stack
+
+
+def write_docker_files(files: Dict[str, str], out_dir: str, stamp: str, out: Callable[[str], None] = print) -> None:
+    """The compose file is replaced (the old one is kept as .bak-<time>). An existing .env is never touched: it may hold the
+    keys you filled in; the new defaults go to .env.new next to it."""
+    os.makedirs(out_dir, exist_ok=True)
+    for name, text in files.items():
+        path = os.path.join(out_dir, name)
+        if name == ".env" and os.path.exists(path):
+            with open(path, encoding="utf-8-sig", newline="") as f:
+                same = f.read() == text
+            if same:
+                out("  %s: unchanged" % path)
+                continue
+            path += ".new"
+            out("  kept your existing .env; new defaults are in %s" % path)
+        out("  %s: %s" % (path, write_file(path, text, 0o600 if name == ".env" else None, stamp)))
+
+
+def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], out: Callable[[str], None]) -> int:
+    d = detected if detected is not None else detect(None, DEFAULT_PREFIX, "")
+    files, stack = docker_files(d, {"profile": args.profile, "gpu": args.gpu, "vision": args.vision,
+                                    "stonesage": not args.no_stonesage})
+    for line in describe(d):
+        out(line)
+    out("docker:    profile %s, %s images" % (stack["profile"], stack["gpu"]))
+    for r in stack["roles"]:
+        out("  %-12s %s on %s" % (r["name"], r["files"][0]["file"], "CPU" if r["gpu"] is None else "GPU %d" % r["gpu"]))
+    for n in stack["notes"]:
+        out("  note: " + n)
+    if args.json:
+        out(json.dumps(compose_dict(stack), indent=2))
+        return 0
+    write_docker_files(files, args.out, time.strftime("%Y%m%d-%H%M%S"), out)
+    out("Next: fill LODESTONE_API_KEY%s in %s, then run `docker compose up -d` there." % (
+        " and HASS_TOKEN" if stack["stonesage"] else "", os.path.join(args.out, ".env")))
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------------------ cli ----
+def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]] = None,
+         out: Callable[[str], None] = print) -> int:
+    ap = argparse.ArgumentParser(prog="python -m lodestone.installer", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--apply", action="store_true", help="really install (Linux, root); without it the plan is only printed")
+    ap.add_argument("--profile", default="auto", choices=["auto"] + list(PROFILES), help="default: from the largest GPU's VRAM")
+    ap.add_argument("--prefix", default=DEFAULT_PREFIX, help="install directory (default %s)" % DEFAULT_PREFIX)
+    ap.add_argument("--config", help="config file to merge endpoint keys into (default PREFIX/config.json)")
+    ap.add_argument("--vision", action="store_true", help="also install the vision engine (needs a GPU with ~6.5 GB to spare)")
+    ap.add_argument("--json", action="store_true", help="print the plan as JSON (nothing is executed)")
+    ap.add_argument("--docker", action="store_true", help="render a Docker Compose stack (docker-compose.yml + .env) instead")
+    ap.add_argument("--gpu", default="auto", choices=["auto"] + list(GPU_KINDS),
+                    help="with --docker: vulkan (AMD/Intel, Linux), cuda (NVIDIA), cpu; default: from what is found, else cpu")
+    ap.add_argument("--out", default=".", help="with --docker: directory for docker-compose.yml and .env (default: here)")
+    ap.add_argument("--no-stonesage", action="store_true", help="with --docker: engines, models and gateway only")
+    args = ap.parse_args(argv)
+    if args.docker and args.apply:
+        print("installer: --docker writes files for `docker compose up`; --apply is the bare-metal install", file=sys.stderr)
+        return 2
+    if args.docker:
+        try:
+            return docker_main(args, detected, out)
+        except InstallerError as e:
+            print("installer: %s" % e, file=sys.stderr)
+            return 1
+    try:
+        prefix = _safe_path("--prefix", args.prefix)
+        config_path = _safe_path("--config", args.config or prefix + "/config.json")
+        d = detected if detected is not None else detect(None, prefix, config_path)
+        steps = plan(d, {"profile": args.profile, "prefix": prefix, "config": config_path, "vision": args.vision})
+        if args.json:
+            out(json.dumps(steps, indent=2))
+            return 0
+        for line in describe(d):
+            out(line)
+        roles, _ = place_roles(choose_profile(d, args.profile), d, args.vision)
+        out("profile:   %s" % choose_profile(d, args.profile))
+        for r in roles:
+            out("  %-12s %s on %s, port %d" % (r["name"], r["files"][0]["file"],
+                                               "CPU" if r["gpu"] is None else "GPU %d" % r["gpu"], r["port"]))
+        out("DRY RUN: nothing is changed. Re-run with --apply (as root, on Linux) to install." if not args.apply else "APPLYING:")
+        apply(steps, dry_run=not args.apply, out=out)
+    except InstallerError as e:
+        print("installer: %s" % e, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
