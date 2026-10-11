@@ -71,6 +71,8 @@ class Gateway:
     # ------------------------------------------------------------------------------------------------- config ----
     def setting(self, key: str) -> Any:
         value = (self.cfg.get("gateway") or {}).get(key)
+        if value in (None, "") and key == "timeout_s" and endpoints.coordinator_on_cpu(self.cfg):
+            return endpoints.CPU_LLM_TIMEOUT_S      # a CPU engine answers in minutes, not seconds
         return DEFAULTS.get(key) if value in (None, "") else value
 
     @property

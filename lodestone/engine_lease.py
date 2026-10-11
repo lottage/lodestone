@@ -3,7 +3,7 @@ Engine lease (docs/plan-2026-09-26-local-loop/DESIGN.md section B; built 2026-09
 layout (Bonsai 2 27B on the Prism fork, :8005) for a while, with a dead man's switch.
 
 Layouts come from config.json engine_layouts (unit, evicts, url, when, optional stand_in, optional disabled reason);
-no unit or model names in code. The layout units on VM 102 carry `Conflicts=` on what they evict, so systemd itself
+no unit or model names in code. The layout units on the engine host carry `Conflicts=` on what they evict, so systemd itself
 keeps one layout at a time: starting the layout stops the evicted engines, and starting the evicted engines again
 (release, expiry, revert) stops the layout.
 

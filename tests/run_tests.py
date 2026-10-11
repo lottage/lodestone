@@ -2,7 +2,7 @@
 Test runner with a hard unit/live split.
 
     python tests/run_tests.py          # unit: tests/test_*.py with every non-localhost connection blocked
-    python tests/run_tests.py live     # live: tests/live/test_*.py against the real homelab (read-only checks)
+    python tests/run_tests.py live     # live: tests/live/test_*.py against the real stack (read-only checks)
     python tests/run_tests.py unit "test_household*.py"   # only the test files matching a glob
 
 Unit tests must never reach the LAN: several harness modules (Valkey A-MEM, the MCP bridge,
@@ -50,9 +50,9 @@ def install_network_guard():
     socket.socket.connect = guarded_connect
     socket.create_connection = guarded_create
 
-    # Sockets are not the only way out: several modules shell out to ssh/scp (VM 102 scripts, some of which CHANGE
+    # Sockets are not the only way out: several modules shell out to ssh/scp (the engine host scripts, some of which CHANGE
     # things, e.g. wildlife_admin.py relabels sightings). Refuse network programs the same way (2026-10-09: the route
-    # golden test found /api/presence/snapshot really SSHing to VM 102 from a unit test).
+    # golden test found /api/presence/snapshot really SSHing to the engine host from a unit test).
     import subprocess
     orig_popen = subprocess.Popen
 

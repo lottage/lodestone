@@ -477,6 +477,20 @@ class WriteTests(unittest.TestCase):
         self.assertEqual(json.loads(lines[-1])["name"], "lodestone")
         self.assertEqual(os.listdir(self.tmp), [])
 
+    def test_cpu_stack_says_what_to_expect_and_marks_the_brain_as_cpu(self):
+        code, lines = self.run_main("--docker", "--out", self.tmp)
+        text = "\n".join(lines)
+        self.assertIn("20-40 tokens/s", text)
+        self.assertIn("GPU is strongly recommended", text)
+        comp = load_yaml(slurp(os.path.join(self.tmp, "docker-compose.yml")))
+        for name in ("gateway", "stonesage"):
+            self.assertEqual(comp["services"][name]["environment"]["COORDINATOR_CPU"], "1", name)
+        code, lines = self.run_main("--docker", "--out", self.tmp + "-gpu", detected=machine("nvidia"))
+        self.addCleanup(shutil.rmtree, self.tmp + "-gpu", True)
+        self.assertNotIn("tokens/s", "\n".join(lines))
+        gpu = load_yaml(slurp(os.path.join(self.tmp + "-gpu", "docker-compose.yml")))
+        self.assertNotIn("COORDINATOR_CPU", gpu["services"]["gateway"]["environment"])
+
     def test_native_dry_run_is_unchanged(self):
         code, lines = self.run_main()
         self.assertEqual(code, 0)

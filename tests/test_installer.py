@@ -637,6 +637,24 @@ class DryRunAndApplyTests(unittest.TestCase):
         self.assertIn("profile:   gpu-large", text)
         self.assertIn("coordinator", text)
 
+    def test_cpu_profile_says_what_to_expect(self):
+        lines = []
+        self.assertEqual(inst.main([], detected=machine("none"), out=lines.append), 0)
+        text = "\n".join(lines)
+        self.assertIn("20-40 tokens/s", text)
+        self.assertIn("few tokens/s", text)
+        self.assertIn("GPU is strongly recommended", text)
+        gpu = []
+        inst.main([], detected=machine("amd2"), out=gpu.append)
+        self.assertNotIn("tokens/s", "\n".join(gpu))                       # a GPU install is not told this
+
+    def test_cpu_plan_marks_the_coordinator_as_cpu_in_config(self):
+        steps = {s["id"]: s for s in inst.plan(machine("none"), {})}
+        cfg = json.loads(next(iter(steps["config"]["files"].values())))
+        self.assertIs(cfg["cluster"]["coordinator_cpu"], True)
+        gpu = {s["id"]: s for s in inst.plan(machine("amd2"), {})}
+        self.assertNotIn("coordinator_cpu", json.loads(next(iter(gpu["config"]["files"].values())))["cluster"])
+
     def test_main_json_prints_the_plan(self):
         lines = []
         self.assertEqual(inst.main(["--json", "--profile", "cpu"], detected=machine("none"), out=lines.append), 0)

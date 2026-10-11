@@ -103,15 +103,21 @@ def normalize_download_url(raw_url: str, custom_filename: Optional[str] = None) 
     return url, filename
 
 
+def _on_engine_host(target: str) -> bool:
+    """Is a download target one of the engine host's node ids (or named by its address)? Anything else downloads locally."""
+    host = endpoints.host("coordinator") or ""
+    return (target or "") in ("node1_primary", "node1_secondary", "dual_gpu") or bool(host and host in (target or ""))
+
+
 class ModelDownloadManager:
     """Thread-safe orchestrator for local and remote model downloads."""
 
     def _target(self) -> str:
         return f"{self._user or endpoints.ssh_user()}@{self._host or endpoints.host('coordinator')}"
 
-    def __init__(self, vm102_host: str = "", vm102_user: str = ""):
+    def __init__(self, engine_host: str = "", engine_user: str = ""):
         # the engines' host (lodestone/endpoints.py), read when a download starts so config changes apply
-        self._host, self._user = vm102_host, vm102_user
+        self._host, self._user = engine_host, engine_user
         self.lock = threading.Lock()
         self._local_thread: Optional[threading.Thread] = None
         self._cancel_flag = threading.Event()
@@ -133,7 +139,7 @@ class ModelDownloadManager:
         }
 
     def get_status(self) -> Dict[str, Any]:
-        """Returns current download status, polling remote host if active on VM 102."""
+        """Returns current download status, polling remote host if active on the engine host."""
         with self.lock:
             try:
                 remote_status = self._read_remote_status()
@@ -179,8 +185,7 @@ class ModelDownloadManager:
                 "updated_at": time.time()
             }
 
-            is_vm102 = target_node in ("node1_primary", "node1_secondary", "vm102_dual") or "105" in target_node
-            if is_vm102:
+            if _on_engine_host(target_node):
                 success, err = self._start_remote_download(url, filename)
                 if not success:
                     self._state["active"] = False
@@ -207,9 +212,7 @@ class ModelDownloadManager:
 
             target = self._state.get("target_node", "")
             filename = self._state.get("filename", "")
-            is_vm102 = target in ("node1_primary", "node1_secondary", "vm102_dual") or "105" in target
-
-            if is_vm102:
+            if _on_engine_host(target):
                 self._cancel_remote_download(filename)
             else:
                 self._cancel_flag.set()
@@ -220,18 +223,18 @@ class ModelDownloadManager:
             return {"ok": True, "status": "cancelled", "filename": filename}
 
     # =========================================================================
-    # Remote VM 102 Execution
+    # Remote Execution on the engine host
     # =========================================================================
 
     def _start_remote_download(self, url: str, filename: str) -> Tuple[bool, Optional[str]]:
-        """Deploys and launches the background downloader on VM 102."""
+        """Deploys and launches the background downloader on the engine host."""
         dest_dir = "/opt/models"
         final_path = f"{dest_dir}/{filename}"
         part_path = f"{final_path}.part"
         status_file = "/tmp/stonesage_dl_status.json"
         cancel_file = "/tmp/stonesage_dl.cancel"
 
-        # Python script to run in background on VM 102
+        # Python script to run in background on the engine host
         remote_script = f"""
 import os, sys, time, json, urllib.request, socket
 
@@ -367,7 +370,7 @@ except Exception as ex:
             return False, str(e)
 
     def _read_remote_status(self) -> Optional[Dict[str, Any]]:
-        """Reads remote status JSON file from VM 102 via SSH."""
+        """Reads remote status JSON file from the engine host via SSH."""
         cmd = endpoints.ssh_cmd(None, "cat /tmp/stonesage_dl_status.json 2>/dev/null", target=self._target())
         try:
             sub = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
@@ -378,7 +381,7 @@ except Exception as ex:
         return None
 
     def _cancel_remote_download(self, filename: str):
-        """Signals VM 102 downloader to abort and clean up."""
+        """Signals the engine host downloader to abort and clean up."""
         cancel_cmd = (
             "touch /tmp/stonesage_dl.cancel && "
             "pkill -f 'stonesage_dl' || true && "

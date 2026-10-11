@@ -175,6 +175,12 @@ def get_profile(cfg: Dict[str, Any], fresh: bool = False) -> Dict[str, Any]:
     return profile
 
 
+def cached_profile() -> Optional[Dict[str, Any]]:
+    """The last profile that was read, or None: for callers that must not wait on a probe (an SSH round trip)."""
+    with _lock:
+        return _cache["profile"]
+
+
 def engine_label(cfg: Dict[str, Any], role: str, default: str = "") -> str:
     """Short label for prompts and logs, e.g. 'Qwen2.5 Coder 3B · RX 6750 XT'. Never raises."""
     try:

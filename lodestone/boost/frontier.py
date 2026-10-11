@@ -3,7 +3,7 @@ Client for the frontier worker on the engine host (lodestone/boost/frontier_work
 The owner's Claude Code / Gemini CLI subscriptions, in a scratch clone, returning an answer and a diff.
 
 Only `general`/`code` content may go there (consumer subscription terms), so every task passes the egress
-scan first; anything that looks like home data or a secret is refused before it leaves LXC 120.
+scan first; anything that looks like home data or a secret is refused before it leaves the StoneSage host.
 """
 
 import json

@@ -49,9 +49,43 @@ class TestEndpoints(unittest.TestCase):
 
     def test_missing_lists_defaults_only(self):
         gone = endpoints.missing(CFG)
-        self.assertIn("worker", gone)
+        self.assertIn("embedder", gone)                                               # core engine left on its default
         self.assertNotIn("coordinator", gone)
         self.assertNotIn("immich", gone)                                              # optional: no default to fall to
+
+    def test_optional_services_are_not_warned_about_unless_used(self):
+        gone = endpoints.missing({"cluster": {"coordinator_url": "http://c:1/v1"}})
+        self.assertEqual(sorted(gone), ["embedder", "homeassistant"])                 # Hearth (the default app) needs HA
+        for name in ("worker", "vision", "mcp", "qdrant", "valkey", "couchdb", "prometheus", "frontier", "voice",
+                     "gemini_web", "assembly", "stonesage"):
+            self.assertIn(name, endpoints.OPTIONAL)
+            self.assertNotIn(name, gone)
+        quiet = endpoints.missing({"apps": [], "cluster": {"coordinator_url": "http://c:1/v1"}})
+        self.assertEqual(quiet, ["embedder"])                                         # no Hearth, no HA warning
+        info = endpoints.missing({"apps": [], "cluster": {}}, optional=True)
+        self.assertIn("worker", info)
+        self.assertIn("voice", info)
+        self.assertNotIn("coordinator", info)
+        self.assertNotIn("immich", info)
+
+    def test_an_optional_service_with_its_own_config_section_is_needed(self):
+        cfg = {"apps": [], "voice": {"stt_engine": "parakeet"}, "couchdb": {"username": "u"}}
+        gone = endpoints.missing(cfg)
+        self.assertIn("voice", gone)                                                  # configured around, URL forgotten
+        self.assertIn("couchdb", gone)
+        self.assertNotIn("voice", endpoints.missing(cfg, optional=True))              # never in both lists
+        self.assertNotIn("voice", endpoints.missing(dict(cfg, voice={"stt_url": "http://v:1"})))
+
+    def test_server_and_boost_sections_do_not_make_stonesage_needed(self):
+        cfg = {"apps": [], "server": {"port": 8888}, "boost": {"enabled": False}}
+        self.assertNotIn("stonesage", endpoints.missing(cfg))
+
+    def test_coordinator_on_cpu(self):
+        self.assertFalse(endpoints.coordinator_on_cpu({}))
+        self.assertTrue(endpoints.coordinator_on_cpu({"cluster": {"coordinator_cpu": True}}))
+        with mock.patch.dict(os.environ, {"COORDINATOR_CPU": "yes"}):
+            self.assertTrue(endpoints.coordinator_on_cpu({}))
+            self.assertFalse(endpoints.coordinator_on_cpu({"cluster": {"coordinator_cpu": False}}))
 
     def test_no_lan_address_in_defaults(self):
         for name, (_, _, default) in endpoints.SERVICES.items():

@@ -3,7 +3,7 @@ Free inference sources Boost can route to (researched 2026-09-24; limits change 
 overridden in config.json `boost.providers.<id>`).
 
 Tiers decide what content may go where (see egress.py):
-    local        our own hardware (VM 102 coordinator, edge nodes such as the workstation or the ROG Ally)
+    local        our own hardware (the coordinator on the engine host, edge nodes such as the workstation or the ROG Ally)
     no_training  the provider says prompts are not retained or used for training (Groq, Cloudflare Workers AI)
     training     free tier whose prompts may be used for training (Gemini free, OpenRouter :free, OpenCode Zen free)
 

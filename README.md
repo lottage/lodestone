@@ -84,6 +84,14 @@ multi-architecture, so Apple Silicon runs them natively. Give Docker Desktop at 
 profile. `--gpu auto` picks `cuda` for NVIDIA, `vulkan` for AMD or Intel on Linux, and `cpu` otherwise. This path is
 tested offline (the generated files are checked against the rules above for every profile and GPU kind); it has not yet been run on real GPUs.
 
+**What to expect on a CPU.** The CPU profile runs a small model (granite-4.0-h-tiny) on the processor. Roughly: a modern
+desktop CPU decodes 20-40 tokens per second, which is fine for chat; an older server CPU manages only a few tokens per
+second, so answers take tens of seconds and the first reply of a conversation (the model reads a long prompt) can take
+minutes. Waits for the model are lengthened automatically on a CPU stack (`COORDINATOR_CPU=1`, set by the installer; or
+`cluster.coordinator_cpu` and `courage.llm_timeout_s` in StoneSage's `config.json`). A GPU is strongly recommended, above
+all for Computer's voice use, which needs answers in a few seconds. The installer prints this note whenever it picks the
+CPU profile.
+
 `docker/` in this repository holds a ready CPU example (`docker/docker-compose.yml`, `docker/.env.example`), and the
 `Dockerfile` at the root builds the gateway image (`docker build -t ghcr.io/lottage/lodestone:latest .`) that the Compose
 file uses for the gateway and the downloader.
@@ -110,7 +118,9 @@ about 6.5 GB to spare). What `--apply` does, in order, stopping at the first fai
    otherwise);
 5. downloads the profile's models from Hugging Face (atomic, resumable, SHA-256 recorded in `models/SHA256SUMS`):
    `gpu-large` Qwen3-14B Q4_K_M, Qwen2.5-Coder-3B Q5_K_M and bge-large-en-v1.5 f16; `gpu-small` Qwen3-8B Q4_K_M and
-   bge; `cpu` granite-4.0-h-tiny Q4_K_M and bge. The table is at the top of `installer.py`, easy to edit;
+   bge; `cpu` granite-4.0-h-tiny Q4_K_M and bge (20-40 tokens/s on a modern desktop CPU, a few on an older server CPU:
+   the installer says so when it picks this profile; a GPU is strongly recommended for voice use). The table is at the
+   top of `installer.py`, easy to edit;
 6. writes one systemd unit per engine and one for the gateway. Engines listen on 127.0.0.1, each GPU engine is pinned
    with `GGML_VK_VISIBLE_DEVICES` and waits at start until Vulkan sees every GPU (an engine that starts before the
    driver is ready silently runs on the CPU);

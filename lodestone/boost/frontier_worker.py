@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Frontier worker (VM 102, :8770): runs whole tasks through the owner's own subscription CLIs.
+Frontier worker (on the engine host, :8770): runs whole tasks through the owner's own subscription CLIs.
 
     claude -p   Claude Code, logged in with the owner's Claude Pro account
     gemini -p   Gemini CLI, logged in with the owner's Google account (Google AI Pro)

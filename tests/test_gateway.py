@@ -145,6 +145,12 @@ class GatewayTest(unittest.TestCase):
         while DEAD:
             DEAD.pop().close()
 
+    def test_upstream_wait_is_longer_for_a_cpu_coordinator_unless_configured(self):
+        cpu = gateway.Gateway({"cluster": {"coordinator_cpu": True}})
+        self.assertEqual(cpu.setting("timeout_s"), 600.0)
+        self.assertEqual(gateway.Gateway({"cluster": {"coordinator_cpu": True}, "gateway": {"timeout_s": 30}}).setting("timeout_s"), 30)
+        self.assertEqual(gateway.Gateway({}).setting("timeout_s"), gateway.DEFAULTS["timeout_s"])
+
     # ------------------------------------------------------------------------------------------------- models ----
     def test_models_union_with_role_aliases(self):
         status, _, body = call(self.base, "/v1/models")

@@ -5,7 +5,7 @@ Boost: free extra inference for Courage and the agents (plan 2026-09-24).
     quota.py      per-source free-tier accounting, 429 cooldowns, background share
     egress.py     what may leave the house (tiered: local / no_training / training)
     router.py     picks a source per call, falls back across sources, then to the local coordinator
-    frontier.py   client for the Claude/Gemini CLI job runner on VM 102
+    frontier.py   client for the Claude/Gemini CLI job runner on the engine host
 
 The server calls `configure()` once; everything else uses `get_router()`.
 """

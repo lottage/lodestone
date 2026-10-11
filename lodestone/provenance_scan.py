@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Model provenance scan (Phase 6, 2026-09-27). Runs on the inference host (VM 102) over SSH; StoneSage's
+Model provenance scan (Phase 6, 2026-09-27). Runs on the inference host over SSH; StoneSage's
 backend/provenance.py sends the job as JSON on stdin and stores the result (CouchDB model_provenance + a local copy).
 
 stdin:  {"builds": [{"id": "mainline", "binary": "/usr/local/bin/llama-server", "source": "/opt/llama.cpp-rocm"}, ...],

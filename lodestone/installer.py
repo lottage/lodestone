@@ -395,6 +395,19 @@ def cpu_threads(d: Dict[str, Any]) -> int:
     return max(1, min(d.get("cpu_count") or 4, 8))      # past ~8 threads decoding gets slower, not faster
 
 
+CPU_EXPECTATION = [
+    "CPU profile: no GPU Lodestone can use was found, so the language model runs on the processor.",
+    "  Expect roughly 20-40 tokens/s for the small model on a modern desktop CPU, and only a few tokens/s on an older server",
+    "  CPU: a short answer takes seconds to a minute, and Computer's first reply of a conversation (it reads a long prompt) can",
+    "  take minutes there. Waits for the model are lengthened to match (600 s). A GPU is strongly recommended, above all for",
+    "  Computer's voice use (it cannot feel like a conversation at CPU speed).",
+]
+
+
+def coordinator_on_cpu(roles: List[Dict[str, Any]]) -> bool:
+    return any(r["name"] == "coordinator" and r["gpu"] is None for r in roles)
+
+
 def engine_argv(role: Dict[str, Any], prefix: str, threads: int, *, backend: str = "vulkan", host: str = ENGINE_HOST,
                 binary: bool = True, models_dir: Optional[str] = None) -> List[str]:
     """llama-server's command line for one role (the rules are in the module docstring). Defaults give the systemd unit's
@@ -678,7 +691,10 @@ def plan(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) -> List[Di
     steps.append({"id": "systemd-units", "why": "one unit per engine (pinned GPU, 127.0.0.1 only, restarts on failure) and one "
                   "for the gateway", "files": files, "modes": modes})
 
-    updates: Dict[str, Any] = {"cluster": {"%s_url" % r["name"]: "http://%s:%d/v1" % (ENGINE_HOST, r["port"]) for r in roles},
+    cluster_updates: Dict[str, Any] = {"%s_url" % r["name"]: "http://%s:%d/v1" % (ENGINE_HOST, r["port"]) for r in roles}
+    if coordinator_on_cpu(roles):
+        cluster_updates["coordinator_cpu"] = True        # lengthens the waits for the model's answers (endpoints.py)
+    updates: Dict[str, Any] = {"cluster": cluster_updates,
                                "gateway": {"host": ENGINE_HOST, "port": GATEWAY_PORT},
                                "lodestone": {"install": {"profile": profile, "prefix": prefix, "llama_cpp_ref": LLAMA_CPP_REF}}}
     merged, added, kept = merge_config(d.get("config") or {}, updates, overwrite=("lodestone.install",))
@@ -950,11 +966,12 @@ def compose_services(stack: Dict[str, Any]) -> Dict[str, Any]:
         s["depends_on"] = {"models": {"condition": "service_completed_successfully"}}
         svc[r["name"]] = s
     urls = {ENGINE_ROLE_ENV[r["name"]]: "http://%s:%d/v1" % (r["name"], r["port"]) for r in roles}
+    cpu_brain = {"COORDINATOR_CPU": "1"} if coordinator_on_cpu(roles) else {}     # longer waits for its answers
     healthy = {r["name"]: {"condition": "service_healthy"} for r in roles}
     svc["gateway"] = {
         "image": "${LODESTONE_IMAGE:-%s}" % GATEWAY_IMAGE, "restart": "unless-stopped",
         "command": ["python", "-m", "lodestone.gateway", "--host", "0.0.0.0", "--port", str(GATEWAY_CONTAINER_PORT)],
-        "environment": dict(urls, LODESTONE_API_KEY="${LODESTONE_API_KEY:-}"),
+        "environment": dict(urls, LODESTONE_API_KEY="${LODESTONE_API_KEY:-}", **cpu_brain),
         "ports": ["${LODESTONE_BIND:-127.0.0.1}:${GATEWAY_PORT:-%d}:%d" % (GATEWAY_CONTAINER_PORT, GATEWAY_CONTAINER_PORT)],
         "healthcheck": {"test": _py_http_check(GATEWAY_CONTAINER_PORT, "/health"), "interval": "30s", "timeout": "5s",
                         "retries": 5, "start_period": "20s"},
@@ -963,7 +980,7 @@ def compose_services(stack: Dict[str, Any]) -> Dict[str, Any]:
         svc["stonesage"] = {
             "image": "${STONESAGE_IMAGE:-%s}" % STONESAGE_IMAGE, "restart": "unless-stopped",
             "environment": dict(urls, STONESAGE_APPS="hearth", HASS_URL="${HASS_URL:-http://homeassistant.local:8123}",
-                                HASS_TOKEN="${HASS_TOKEN:-}", TZ="${TZ:-UTC}"),
+                                HASS_TOKEN="${HASS_TOKEN:-}", TZ="${TZ:-UTC}", **cpu_brain),
             "ports": ["${STONESAGE_BIND:-127.0.0.1}:${STONESAGE_PORT:-%d}:%d" % (STONESAGE_CONTAINER_PORT, STONESAGE_CONTAINER_PORT)],
             "volumes": ["stonesage-config:/config", "stonesage-data:/data"],
             "healthcheck": {"test": ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', %d), 3).close()"
@@ -1118,6 +1135,9 @@ def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], ou
         out("  %-12s %s on %s" % (r["name"], r["files"][0]["file"], "CPU" if r["gpu"] is None else "GPU %d" % r["gpu"]))
     for n in stack["notes"]:
         out("  note: " + n)
+    if coordinator_on_cpu(stack["roles"]):
+        for line in CPU_EXPECTATION:
+            out(line)
     if args.json:
         out(json.dumps(compose_dict(stack), indent=2))
         return 0
@@ -1167,6 +1187,9 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
         for r in roles:
             out("  %-12s %s on %s, port %d" % (r["name"], r["files"][0]["file"],
                                                "CPU" if r["gpu"] is None else "GPU %d" % r["gpu"], r["port"]))
+        if coordinator_on_cpu(roles):
+            for line in CPU_EXPECTATION:
+                out(line)
         out("DRY RUN: nothing is changed. Re-run with --apply (as root, on Linux) to install." if not args.apply else "APPLYING:")
         apply(steps, dry_run=not args.apply, out=out)
     except InstallerError as e:

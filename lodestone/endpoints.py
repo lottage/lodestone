@@ -2,8 +2,10 @@
 
 A service's address comes from config.json (the first of its paths that is set), else its environment variable, else a
 default. Defaults are for one box running everything (localhost); a spread-out install says where things are in
-config.json. `missing(cfg)` lists what is still on a default, and the server logs it at start, so a forgotten key shows
-up instead of quietly pointing at localhost.
+config.json. `missing(cfg)` lists what is still on a default and is needed by this install, and the server warns about
+it at start, so a forgotten key shows up instead of quietly pointing at localhost. Optional services (OPTIONAL) are
+not warned about unless the config has a section of its own for them; `missing(cfg, optional=True)` lists the rest
+(the server logs those at INFO level).
 
     endpoints.url("coordinator", cfg)          -> "http://10.0.0.5:8001/v1" (from cluster.coordinator_url)
     endpoints.host("valkey", cfg), endpoints.port("valkey", cfg)
@@ -43,6 +45,15 @@ SERVICES: Dict[str, Tuple[Tuple[Tuple[str, ...], ...], str, str]] = {
     "blender": ((("blender", "url"),), "BLENDER_URL", ""),          # shelved (Citadel 3D)
     "assembly": ((("cluster", "assembly_url"),), "ASSEMBLY_HTTP", "http://127.0.0.1:8766"),   # shelved
 }
+
+# Services a basic install does without. Never warned about for sitting on their localhost default; a service in this
+# set counts as used once config.json has a section of its own for it (voice, couchdb, qdrant, frontier, ...).
+# Not in the set: the two core engines (coordinator, embedder) always, and homeassistant while the Hearth app is loaded.
+OPTIONAL = frozenset({"worker", "vision", "mcp", "qdrant", "valkey", "couchdb", "prometheus", "frontier", "voice",
+                      "voice_legacy", "proxmox", "immich", "freshrss", "kavita", "gemini_web", "stonesage", "blender",
+                      "assembly", "homeassistant"})
+_HOME_APPS = ("hearth", "home")
+_SHARED_SECTIONS = ("cluster", "server", "boost")      # sections that exist in every install, whatever is used
 
 # A bare host in config ("10.0.0.5", "nas.local:8123") borrows the scheme and port of the service's default.
 _SCHEMES = {"valkey": "redis", "voice_legacy": "http", "proxmox": "https"}
@@ -88,10 +99,59 @@ def port(name: str, cfg: Optional[Dict[str, Any]] = None) -> Optional[int]:
     return u.port or _PORTS.get(name) or {"http": 80, "https": 443}.get(u.scheme)
 
 
-def missing(cfg: Optional[Dict[str, Any]] = None, names: Sequence[str] = ()) -> List[str]:
-    """Services with a default that run on it because config.json and the environment say nothing (logged at start)."""
+def _has_section(name: str, cfg: Dict[str, Any]) -> bool:
+    """True when config.json has a section of its own for the service (not the shared 'cluster' one)."""
+    for path in SERVICES[name][0]:
+        if path[0] not in _SHARED_SECTIONS and isinstance(cfg.get(path[0]), dict) and cfg[path[0]]:
+            return True
+    return False
+
+
+def needed(name: str, cfg: Dict[str, Any]) -> bool:
+    """Does this install use the service? The core engines always; Home Assistant while the Hearth app is loaded;
+    any other when config.json has a section for it."""
+    if name not in OPTIONAL:
+        return True
+    if name == "homeassistant":
+        apps = cfg.get("apps", ["hearth"])
+        return any(a in _HOME_APPS for a in (apps if isinstance(apps, list) else [])) or _has_section(name, cfg)
+    return _has_section(name, cfg)
+
+
+def missing(cfg: Optional[Dict[str, Any]] = None, names: Sequence[str] = (), optional: bool = False) -> List[str]:
+    """Services with a default that run on it because config.json and the environment say nothing (warned about at
+    start). Only the ones this install needs; optional=True gives the others instead (for an INFO line)."""
     cfg = _cfg(cfg)
-    return [n for n in (names or SERVICES) if SERVICES[n][2] and not _configured(n, cfg)]
+    return [n for n in (names or SERVICES)
+            if SERVICES[n][2] and not _configured(n, cfg) and needed(n, cfg) is not optional]
+
+
+# ------------------------------------------------------------------------------------------------ the brain's speed ----
+# A coordinator on a CPU answers a few tokens a second and reads a long prompt for minutes: every wait on it is longer.
+CPU_LLM_TIMEOUT_S = 600.0
+GPU_LLM_TIMEOUT_S = 90.0
+
+
+def _truthy(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return None
+
+
+def coordinator_on_cpu(cfg: Optional[Dict[str, Any]] = None, profile: Optional[Dict[str, Any]] = None) -> bool:
+    """Does the coordinator engine run on a CPU? A hint wins: config cluster.coordinator_cpu (true/false), else the
+    environment COORDINATOR_CPU (the Docker stack sets it), else the live system profile when it was already read
+    (the coordinator running with nothing resident in any GPU's memory), else False."""
+    cfg = _cfg(cfg)
+    hint = _truthy((cfg.get("cluster") or {}).get("coordinator_cpu"))
+    if hint is None:
+        hint = _truthy(os.environ.get("COORDINATOR_CPU"))
+    if hint is not None:
+        return hint
+    eng = ((profile or {}).get("engines") or {}).get("coordinator") or {}
+    return bool(eng.get("online") and eng.get("offloaded"))
 
 
 # ------------------------------------------------------------------------------------------------------------ SSH ----
