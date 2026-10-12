@@ -1138,7 +1138,7 @@ LLAMA_CPP_IMAGE_VARIANT = {"vulkan": "server-vulkan", "cuda": "server-cuda", "cp
 # the git tag of all three repositories, and the compose file names images by it (never `latest`) and builds from it. The
 # source tree carries the number of the next release; a tree built without --tag carries the placeholder, which a release
 # refuses (release_public_repos.py). Image versions drop the leading v: tag v0.1.0-rc.2 = image 0.1.0-rc.2.
-RELEASE_TAG = "v0.1.0-rc.3"
+RELEASE_TAG = "v0.1.0-rc.4"
 UNSET_TAG = "UNSET-TAG"
 GITHUB_ORG = "https://github.com/lottage"
 IMAGE_REGISTRY = "ghcr.io/lottage"
