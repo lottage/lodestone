@@ -12,7 +12,7 @@ grade too leniently, see CLAUDE.md). `egress_allowed()` is the policy on top.
 """
 
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 CLASS_RANK = {"general": 0, "code": 1, "home": 2, "secret": 3}
 
@@ -30,16 +30,38 @@ SECRET_PATTERNS = [
 ]
 
 
+def iter_strings(obj: Any, keys: bool = True, _depth: int = 0) -> Iterator[str]:
+    """Every piece of text in a request part, however deep: strings, the keys of objects (tool parameter names are text too),
+    and the contents of lists and nested objects. Embedded pictures and audio (`data:` URIs) are not text: `has_images` sees them."""
+    if _depth > 16:
+        return
+    if isinstance(obj, str):
+        if not obj.startswith("data:"):
+            yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            if keys and isinstance(k, str):
+                yield k
+            yield from iter_strings(v, keys, _depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from iter_strings(v, keys, _depth + 1)
+
+
 def _texts(messages: Iterable[Dict[str, Any]]) -> List[str]:
-    out: List[str] = []
-    for m in messages or []:
-        c = m.get("content")
-        if isinstance(c, str):
-            out.append(c)
-        elif isinstance(c, list):
-            out.extend(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
-        for tc in m.get("tool_calls") or []:
-            out.append(str((tc.get("function") or {}).get("arguments", "")))
+    """The text of the messages, every nested part included (used to size a request; the scan uses `request_texts`)."""
+    return list(iter_strings(list(messages or []), keys=False))
+
+
+def request_texts(messages: Iterable[Dict[str, Any]], tools: Any = None, extra: Any = None) -> List[str]:
+    """EVERYTHING in a request that is sent to the source as text: the system prompt and all messages (user, assistant, and tool
+    results, with their tool-call names and arguments and any nested content parts), the tool schemas (names, descriptions,
+    parameter descriptions and enums) and the extra body fields (`stop`, `response_format`...). Anything sent must be scanned."""
+    out = list(iter_strings(list(messages or [])))
+    if tools:
+        out.extend(iter_strings(tools))
+    if extra:
+        out.extend(iter_strings(extra))
     return out
 
 
@@ -48,7 +70,8 @@ def has_images(messages: Iterable[Dict[str, Any]]) -> bool:
         if m.get("images"):
             return True
         c = m.get("content")
-        if isinstance(c, list) and any(isinstance(p, dict) and p.get("type") in ("image_url", "input_image") for p in c):
+        if isinstance(c, list) and any(isinstance(p, dict) and (p.get("type") in ("image_url", "input_image", "image")
+                                                                 or "image_url" in p) for p in c):
             return True
     return False
 
@@ -70,11 +93,14 @@ def scan(text: str, home_terms: Iterable[str] = ()) -> List[str]:
     return hits
 
 
-def classify(declared: str, messages: Iterable[Dict[str, Any]], home_terms: Iterable[str] = ()) -> Dict[str, Any]:
-    """Effective class = the more sensitive of what the caller declared and what the scan finds."""
+def classify(declared: str, messages: Iterable[Dict[str, Any]], home_terms: Iterable[str] = (),
+             tools: Any = None, extra: Any = None) -> Dict[str, Any]:
+    """Effective class = the more sensitive of what the caller declared and what the scan finds. The scan reads everything
+    that leaves (`request_texts`): messages including tool results, tool schemas, and the extra body fields."""
     cls = declared if declared in CLASS_RANK else "general"
+    messages = list(messages or [])
     hits: List[str] = []
-    for t in _texts(messages):
+    for t in request_texts(messages, tools, extra):
         hits.extend(scan(t, home_terms))
     for h in hits:
         found = h.split(":", 1)[0]

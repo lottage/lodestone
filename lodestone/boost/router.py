@@ -300,7 +300,7 @@ class BoostRouter:
                  ) -> Dict[str, Any]:
         """Non-streaming completion. Returns {ok, provider, model, tier, data | error, tried, skipped}."""
         t0 = self.clock()
-        verdict = egress.classify(declared, messages, self.home_terms())
+        verdict = egress.classify(declared, messages, self.home_terms(), tools=tools, extra=extra)
         cands, skipped = self.candidates(surface, verdict, bool(tools), _est_tokens(messages, max_tokens), pinned, allow_local)
         tried: List[str] = []
         timeout = self.settings()["timeout_s"]
@@ -333,7 +333,7 @@ class BoostRouter:
         Usage is recorded here with an estimate (streams rarely report token counts). The trace's ms is the time to
         the first answering source, not to the end of the stream."""
         t0 = self.clock()
-        verdict = egress.classify(declared, messages, self.home_terms())
+        verdict = egress.classify(declared, messages, self.home_terms(), tools=tools, extra=extra)
         est = _est_tokens(messages, max_tokens)
         cands, skipped = self.candidates(surface, verdict, bool(tools), est, pinned, allow_local)
         tried: List[str] = []

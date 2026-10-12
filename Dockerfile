@@ -6,7 +6,9 @@
 #     docker run --rm -p 127.0.0.1:8000:8000 -e COORDINATOR_URL=http://host.docker.internal:8001/v1 \
 #         -e LODESTONE_API_KEY=... ghcr.io/lottage/lodestone:latest
 # (From the private monorepo the same file builds with the context StoneSage/backend.)
-FROM python:3.12-slim
+# Base image: an exact version tag, never a floating one. digest: pin at release (docker buildx imagetools inspect python:3.12.7-slim-bookworm,
+# then FROM python:3.12.7-slim-bookworm@sha256:<digest>); tests/test_docker_files.py checks every FROM has an exact tag.
+FROM python:3.12.7-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
 

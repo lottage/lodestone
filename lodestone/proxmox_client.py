@@ -5,22 +5,35 @@ and executes safe lifecycle operations (reboot, start, shutdown).
 Falls back to TCP socket health checks when API token is unconfigured.
 """
 
+import logging
 import ssl
 import json
-from lodestone import endpoints
+from lodestone import endpoints, tls
 import urllib.request
 import urllib.error
 import socket
 import time
 from typing import Dict, Any, List, Optional
 
+logger = logging.getLogger("stonesage.proxmox")
+_warned: set = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """The cockpit polls often: say a failure once per node and kind, not on every poll."""
+    if key not in _warned:
+        _warned.add(key)
+        logger.warning(message)
+
+
 class ProxmoxClient:
     def __init__(self, node_configs: Dict[str, Any]):
         self.node_configs = node_configs
-        # Unverified SSL context for local self-signed Proxmox certificates
-        self.ssl_ctx = ssl.create_default_context()
-        self.ssl_ctx.check_hostname = False
-        self.ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    def _ssl_ctx(self, node_config: Dict[str, Any]) -> ssl.SSLContext:
+        """Verified by default (lodestone/tls.py). A self-signed Proxmox sets `ca_file` (its PEM certificate) or, knowingly,
+        `verify_tls: false`, in the "proxmox" section or on the node's own entry (the node wins)."""
+        return tls.context(self.node_configs, node_config if isinstance(node_config, dict) else None, name="proxmox")
 
     def _get_headers(self, config: Dict[str, Any]) -> Dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -87,7 +100,7 @@ class ProxmoxClient:
         url = f"https://{host}:{port}/api2/json/nodes/{node_name}/status"
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=3.5) as resp:
+            with urllib.request.urlopen(req, context=self._ssl_ctx(config), timeout=3.5) as resp:
                 data = json.loads(resp.read().decode("utf-8")).get("data", {})
                 cpu_usage = round(data.get("cpu", 0) * 100, 1)
                 mem_data = data.get("memory", {})
@@ -143,7 +156,7 @@ class ProxmoxClient:
                 "online": True,
                 "latency_ms": ping_res.get("latency_ms"),
                 "token_configured": True,
-                "error": str(e)
+                "error": tls.explain(e, "Proxmox")
             }
 
     def get_guests(self, node_key: str) -> Dict[str, Any]:
@@ -163,27 +176,27 @@ class ProxmoxClient:
         try:
             lxc_url = f"https://{host}:{port}/api2/json/nodes/{node_name}/lxc"
             req = urllib.request.Request(lxc_url, headers=headers)
-            with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=3.5) as resp:
+            with urllib.request.urlopen(req, context=self._ssl_ctx(config), timeout=3.5) as resp:
                 data = json.loads(resp.read().decode("utf-8")).get("data", [])
                 for item in data:
                     item["type"] = "lxc"
                     item["node"] = node_name
                     guests.append(item)
-        except Exception:
-            pass
+        except Exception as e:
+            _warn_once("lxc:" + node_name, f"Proxmox: cannot list containers on {node_name}: {tls.explain(e, 'Proxmox')}")
 
         # Query VMs (QEMU)
         try:
             vm_url = f"https://{host}:{port}/api2/json/nodes/{node_name}/qemu"
             req = urllib.request.Request(vm_url, headers=headers)
-            with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=3.5) as resp:
+            with urllib.request.urlopen(req, context=self._ssl_ctx(config), timeout=3.5) as resp:
                 data = json.loads(resp.read().decode("utf-8")).get("data", [])
                 for item in data:
                     item["type"] = "qemu"
                     item["node"] = node_name
                     guests.append(item)
-        except Exception:
-            pass
+        except Exception as e:
+            _warn_once("qemu:" + node_name, f"Proxmox: cannot list VMs on {node_name}: {tls.explain(e, 'Proxmox')}")
 
         return {"ok": True, "guests": guests}
 
@@ -204,8 +217,8 @@ class ProxmoxClient:
         
         req = urllib.request.Request(url, data=b"", headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=5) as resp:
+            with urllib.request.urlopen(req, context=self._ssl_ctx(config), timeout=5) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 return {"ok": True, "upid": res.get("data"), "message": f"Reboot initiated for {path_type} {vmid}"}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": tls.explain(e, "Proxmox")}

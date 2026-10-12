@@ -48,6 +48,11 @@ class TestSite(unittest.TestCase):
         src = open(site.__file__, encoding="utf-8").read()
         self.assertNotIn("America/", src)                                  # nor in its docs: they are public
 
+    def test_clock_is_twelve_hour_unless_configured(self):
+        for h, m, want in ((0, 5, "12:05 AM"), (2, 11, "2:11 AM"), (12, 0, "12:00 PM"), (14, 4, "2:04 PM"), (23, 59, "11:59 PM")):
+            self.assertEqual(site.clock(datetime(2026, 1, 1, h, m), {}), want)
+        self.assertEqual(site.clock(datetime(2026, 1, 1, 14, 4), {"server": {"clock": "24h"}}), "14:04")
+
 
 if __name__ == "__main__":
     unittest.main()

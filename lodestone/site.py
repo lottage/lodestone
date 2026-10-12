@@ -32,6 +32,15 @@ def local_tz(cfg: Optional[Dict[str, Any]] = None) -> tzinfo:
     return datetime.now().astimezone().tzinfo
 
 
+def clock(dt: datetime, cfg: Optional[Dict[str, Any]] = None) -> str:
+    """A time of day the way this household says it: "2:04 PM" (default) or "14:04" with config.json
+    `server.clock` = "24h". The agent repeats the clock it is shown, so every time it may speak goes through here."""
+    cfg = load_cfg() if cfg is None else cfg
+    if str((cfg.get("server") or {}).get("clock") or "").lower() == "24h":
+        return dt.strftime("%H:%M")
+    return f"{dt.hour % 12 or 12}:{dt:%M} {'AM' if dt.hour < 12 else 'PM'}"
+
+
 def obsidian_vault(cfg: Optional[Dict[str, Any]] = None) -> str:
     """The user's Obsidian vault: config.json obsidian.user_vault_path, else OBSIDIAN_VAULT / OBSIDIAN_VAULT_PATH,
     else "" (no vault configured: callers skip it)."""
