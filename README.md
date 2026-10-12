@@ -44,20 +44,49 @@ chunk. Configuration lives under `gateway` in `config.json`: `gateway.host` (def
 `Authorization: Bearer` checking. Without a key the gateway listens on loopback only: asking it to bind anywhere wider
 without one is refused, and it will not start.
 
+### What you need first
+
+A clean machine needs these once, before the commands below.
+
+**Python 3.10 or newer with `venv`, and git.** pip fetches the layers from GitHub, so even a pip install needs git. Modern
+Linux (Ubuntu 24.04 among them) refuses `pip install` outside a virtual environment, so make one:
+
+- Ubuntu / Debian: `sudo apt install git python3-venv python3-pip`, then
+  `python3 -m venv ~/stonesage && . ~/stonesage/bin/activate`
+- Windows (PowerShell): install Python 3.10+ and Git for Windows, then
+  `py -m venv $HOME\stonesage; & $HOME\stonesage\Scripts\Activate.ps1`
+  (if PowerShell refuses the script: `Set-ExecutionPolicy -Scope Process RemoteSigned`, then repeat)
+- macOS: `brew install python git` (or the python.org installer), then
+  `python3 -m venv ~/stonesage && . ~/stonesage/bin/activate`
+
+**For the Docker install: Docker Engine, the Compose plugin and Buildx.** Docker Desktop (Windows, macOS) has all three. On
+Ubuntu or Debian use Docker's own apt repository (`docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+docker-compose-plugin`), or Ubuntu's `docker.io` plus `docker-buildx` and `docker-compose-v2`: `docker.io` alone has no Buildx,
+and the legacy builder it falls back to is deprecated and can fail. Compose 2.20 or newer (`docker compose version`). For an
+NVIDIA GPU also the NVIDIA driver and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/); for an AMD or Intel GPU,
+Linux with `/dev/dri`.
+
 ## Install with Docker
 
-Docker is the way in that works the same on Linux, Windows and macOS. Python 3.10+ writes the Compose files, so nothing
-else has to be installed besides Docker itself:
+Docker is the way in that works the same on Linux, Windows and macOS. Python 3.10+ writes the Compose files, Docker runs
+them (with the tools above in place):
 
 ```
-pip install git+https://github.com/lottage/lodestone
+pip install "git+https://github.com/lottage/lodestone@v0.1.0-rc.2"
 python -m lodestone.installer --docker          # looks at the machine, writes docker-compose.yml and .env here
-# the installer wrote your API keys into .env; start the stack
-docker compose up -d
+# the installer wrote your API keys into .env; start the stack (the installer prints this line with the right folder)
+docker compose up -d --build
 ```
 
-(`--docker` also takes `--profile auto|gpu-large|gpu-small|cpu`, `--gpu auto|vulkan|cuda|cpu`, `--out DIR`, `--vision` and
-`--no-stonesage`.) What comes up:
+**Images.** While a release has no published images (every pre-release, such as v0.1.0-rc.2) the installer writes `build:`
+sections: Compose builds the layers' images itself from GitHub at that tag (no clone needed; the first start takes a few
+minutes longer), then downloads the models. For a release with published images the file names them by version instead
+(`ghcr.io/lottage/<layer>:0.1.0-rc.2`, never `latest`). `--build` / `--no-build` override the choice; the one command,
+`docker compose up -d --build`, works either way.
+
+(`--docker` also takes `--profile auto|<rung>` (below), `--gpu auto|vulkan|cuda|cpu`, `--out DIR`, `--vision`,
+`--no-stonesage` and `--build` / `--no-build`.) What comes up:
 
 - one engine container per role (coordinator, and for the bigger profiles a worker and an embedder), each running
   llama.cpp's own published server image (`ghcr.io/ggml-org/llama.cpp`, pinned to one build; change the tag in `.env`),
@@ -65,7 +94,7 @@ docker compose up -d
   always has a value, `--jinja` on the chat models, `--metrics` on;
 - `models`: a one-shot container that downloads the profile's GGUF files from Hugging Face into a shared volume
   (resumable, SHA-256 recorded; `LODESTONE_VERIFY_MODELS=1` re-checks them), then exits. The engines wait for it and mount
-  the volume read-only. The first start downloads 5 to 12 GB depending on the profile;
+  the volume read-only. The first start downloads 2 to 21 GB depending on the profile;
 - `gateway`: the one address to use, an OpenAI-compatible API on `http://localhost:8000/v1` (bound to this computer
   only until you change `LODESTONE_BIND`), with the engines reached by service name;
 - `stonesage`: the StoneSage cockpit with the Hearth app on `http://localhost:8888`; leave it out with `--no-stonesage`.
@@ -83,8 +112,33 @@ Compose file (keeping a `.bak-<time>` copy) and never touches an existing `.env`
 
 The CPU profile is the default whenever no usable GPU is visible, so the same command works everywhere; the images are
 multi-architecture, so Apple Silicon runs them natively. Give Docker Desktop at least 8 GB of memory for the CPU
-profile. `--gpu auto` picks `cuda` for NVIDIA, `vulkan` for AMD or Intel on Linux, and `cpu` otherwise. This path is
-tested offline (the generated files are checked against the rules above for every profile and GPU kind); it has not yet been run on real GPUs.
+profile. `--gpu auto` picks `cuda` for NVIDIA, `vulkan` for AMD or Intel on Linux, and `cpu` otherwise.
+
+The Docker path has been run end to end on an NVIDIA GPU (CUDA, a Quadro M2000 with 4 GB, 2026-10-11) and on a CPU-only
+stack (2026-10-12). The AMD / Intel path through `/dev/dri` (Vulkan), and most rungs of the GPU ladder
+(`python -m lodestone.installer --list-profiles`), are tested offline only: the generated files are checked against the
+rules the engines need, not run.
+
+### GPU profiles
+
+The installer names every card it finds, with its memory and which probe reported it (`nvidia-smi`, sysfs or Vulkan), and
+picks the rung of this ladder that the largest card reaches: `found Quadro M2000, 4.0 GB -> gpu-4gb`. A card under 2 GB, an
+integrated GPU, or none means the CPU profile, and the installer says which. `--profile gpu-4gb` (any rung) forces a rung,
+also on a card the probes cannot size; `python -m lodestone.installer --list-profiles` prints this table with the reasoning
+behind every row. The old names `gpu-large` and `gpu-small` are aliases of `gpu-12gb` and `gpu-8gb`. A second card takes the
+vision engine and the embedder when they do not fit beside the main model.
+
+| Profile | VRAM | Typical cards | Models | Speed |
+| --- | --- | --- | --- | --- |
+| `gpu-24gb` | 23 GB and up | RTX 3090 / 4090, RX 7900 XTX, RTX A5000 | coordinator: Qwen3-32B-Q4_K_M.gguf, 19.8 GB (GPU)<br>embedder: bge-large-en-v1.5-f16.gguf, 0.7 GB (GPU) | not measured |
+| `gpu-16gb` | 15.5 to 23 GB | RTX 4060 Ti 16 GB, 4070 Ti Super, 4080, RTX A4000, RX 6800 / 6900 / 7800 XT | coordinator: Qwen3-14B-Q4_K_M.gguf + Qwen3-0.6B-Q8_0.gguf (draft), 9.6 GB (GPU)<br>vision: Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf + mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf, 6.0 GB (GPU)<br>embedder: bge-large-en-v1.5-f16.gguf, 0.7 GB (GPU) | ~41 tok/s for the 14B on an RX 6750 XT (same engine as gpu-12gb) |
+| `gpu-12gb` | 11.5 to 15.5 GB | RTX 3060 12 GB, RTX 4070 / 4070 Ti, RX 6700 XT / 6750 XT, Arc B580 | coordinator: Qwen3-14B-Q4_K_M.gguf + Qwen3-0.6B-Q8_0.gguf (draft), 9.6 GB (GPU)<br>worker: qwen2.5-coder-3b-instruct-q5_k_m.gguf, 2.4 GB (GPU)<br>embedder: bge-large-en-v1.5-f16.gguf, 0.7 GB (GPU) | ~41 tok/s (RX 6750 XT, measured); Computer's tool eval 45/46 |
+| `gpu-8gb` | 7.5 to 11.5 GB | RTX 3060 Ti / 3070 / 4060, RX 6600 / 7600, Arc A750 | coordinator: Qwen3-8B-Q4_K_M.gguf, 5.0 GB (GPU)<br>embedder: bge-large-en-v1.5-f16.gguf, 0.7 GB (GPU) | not measured |
+| `gpu-6gb` | 5.5 to 7.5 GB | GTX 1060 6 GB, RTX 2060, RTX 3060 laptop 6 GB, RX 5600 XT | coordinator: granite-4.0-h-tiny-Q4_K_M.gguf, 4.2 GB (GPU)<br>embedder: bge-large-en-v1.5-f16.gguf, 0.7 GB (GPU) | 75 tok/s (RX 6600, measured) |
+| `gpu-4gb` | 3.5 to 5.5 GB | GTX 1650, RTX 3050 4 GB laptop, Quadro M2000 / P1000 / T1000, RX 6400 / 6500 XT | coordinator: Qwen3-4B-Q4_K_M.gguf, 2.5 GB (GPU)<br>embedder: bge-large-en-v1.5-f16.gguf, 0.7 GB (GPU) | 13.1 tok/s through the gateway (Quadro M2000, measured 2026-10-11) |
+| `gpu-2gb` | 2 to 3.5 GB | GT 1030, GTX 1050 2 GB, GTX 1060 3 GB, MX150 / MX250 laptop GPUs | coordinator: granite-4.0-h-tiny-Q4_K_M.gguf, 4.2 GB (12 layers on the GPU, the rest on the CPU)<br>embedder: bge-large-en-v1.5-f16.gguf, 0.7 GB (CPU) | not measured (partial offload: the CPU's speed, a little better) |
+| `cpu` | no GPU, or under 2 GB | no GPU, integrated graphics, a card under 2 GB | coordinator: granite-4.0-h-tiny-Q4_K_M.gguf, 4.2 GB (CPU)<br>embedder: bge-large-en-v1.5-f16.gguf, 0.7 GB (CPU) | 20-40 tok/s on a modern desktop CPU (Granite: 35 on an i7-12700K, measured); a few on an old server CPU |
+
 
 **What to expect on a CPU.** The CPU profile runs a small model (granite-4.0-h-tiny) on the processor. Roughly: a modern
 desktop CPU decodes 20-40 tokens per second, which is fine for chat; an older server CPU manages only a few tokens per
@@ -95,7 +149,7 @@ all for Computer's voice use, which needs answers in a few seconds. The installe
 CPU profile.
 
 `docker/` in this repository holds a ready CPU example (`docker/docker-compose.yml`, `docker/.env.example`), and the
-`Dockerfile` at the root builds the gateway image (`docker build -t ghcr.io/lottage/lodestone:latest .`) that the Compose
+`Dockerfile` at the root builds the gateway image (`docker build -t ghcr.io/lottage/lodestone:0.1.0-rc.2 .`) that the Compose
 file uses for the gateway and the downloader.
 
 ## Install on a fresh machine without Docker (bare metal, Ubuntu 24.04)
@@ -109,9 +163,10 @@ right:
 sudo python -m lodestone.installer --apply
 ```
 
-Options: `--profile auto|gpu-large|gpu-small|cpu` (`auto` chooses by the VRAM of the largest GPU: 11.5 GB or more,
-7.5 GB or more, else CPU), `--prefix /opt/lodestone`, `--config PATH` and `--vision` (a vision engine, if a GPU has
-about 6.5 GB to spare). What `--apply` does, in order, stopping at the first failure:
+Options: `--profile auto|gpu-24gb|gpu-16gb|gpu-12gb|gpu-8gb|gpu-6gb|gpu-4gb|gpu-2gb|cpu` (`auto` picks the rung of the
+ladder above that the largest GPU's VRAM reaches), `--list-profiles`, `--prefix /opt/lodestone`, `--config PATH` and
+`--vision` (a vision engine, if a GPU has about 6.5 GB to spare). What `--apply` does, in order, stopping at the first
+failure:
 
 1. checks Linux, root, Ubuntu or Debian, and free disk space;
 2. installs the build packages with apt (the Vulkan headers, drivers and shader compiler only for the GPU profiles);
@@ -119,10 +174,10 @@ about 6.5 GB to spare). What `--apply` does, in order, stopping at the first fai
 4. clones llama.cpp at one pinned commit and builds `llama-server` with cmake (Vulkan for the GPU profiles, CPU
    otherwise);
 5. downloads the profile's models from Hugging Face (atomic, resumable, SHA-256 recorded in `models/SHA256SUMS`):
-   `gpu-large` Qwen3-14B Q4_K_M, Qwen2.5-Coder-3B Q5_K_M and bge-large-en-v1.5 f16; `gpu-small` Qwen3-8B Q4_K_M and
-   bge; `cpu` granite-4.0-h-tiny Q4_K_M and bge (20-40 tokens/s on a modern desktop CPU, a few on an older server CPU:
-   the installer says so when it picks this profile; a GPU is strongly recommended for voice use). The table is at the
-   top of `installer.py`, easy to edit;
+   the ladder's models for the rung (from Qwen3-32B on a 24 GB card to Granite 4.0 h-tiny on a small card or the CPU, plus
+   the bge-large-en-v1.5 f16 embedder; 20-40 tokens/s on a modern desktop CPU, a few on an older server CPU: the installer
+   says so when it picks the CPU profile; a GPU is strongly recommended for voice use). The table is at the top of
+   `installer.py`, easy to edit;
 6. writes one systemd unit per engine and one for the gateway. Engines listen on 127.0.0.1, each GPU engine is pinned
    with `GGML_VK_VISIBLE_DEVICES` and waits at start until Vulkan sees every GPU (an engine that starts before the
    driver is ready silently runs on the CPU);
@@ -138,7 +193,7 @@ on real hardware is still to come.
 ## Install the Python package
 
 ```
-pip install git+https://github.com/lottage/lodestone
+pip install "git+https://github.com/lottage/lodestone@v0.1.0-rc.2"
 ```
 
 From a checkout:

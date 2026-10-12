@@ -163,18 +163,18 @@ class ReaderTests(unittest.TestCase):
 
 # ----------------------------------------------------------------------------------------------- the rules per file ----
 CASES = [   # (machine, choices, expected profile, expected kind)
-    ("amd2", {"gpu": "vulkan"}, "gpu-large", "vulkan"),
-    ("amd1", {"gpu": "vulkan"}, "gpu-small", "vulkan"),
-    ("amd2", {"gpu": "auto"}, "gpu-large", "vulkan"),
-    ("nvidia", {"gpu": "cuda"}, "gpu-large", "cuda"),
-    ("nvidia", {"gpu": "auto"}, "gpu-large", "cuda"),
-    ("nvidia-smi-only", {"gpu": "auto", "system": "Windows"}, "gpu-large", "cuda"),
-    ("nvidia", {"gpu": "cuda", "profile": "gpu-small"}, "gpu-small", "cuda"),
-    ("amd2", {"gpu": "vulkan", "profile": "gpu-small"}, "gpu-small", "vulkan"),
+    ("amd2", {"gpu": "vulkan"}, "gpu-12gb", "vulkan"),
+    ("amd1", {"gpu": "vulkan"}, "gpu-8gb", "vulkan"),
+    ("amd2", {"gpu": "auto"}, "gpu-12gb", "vulkan"),
+    ("nvidia", {"gpu": "cuda"}, "gpu-12gb", "cuda"),
+    ("nvidia", {"gpu": "auto"}, "gpu-12gb", "cuda"),
+    ("nvidia-smi-only", {"gpu": "auto", "system": "Windows"}, "gpu-12gb", "cuda"),
+    ("nvidia", {"gpu": "cuda", "profile": "gpu-8gb"}, "gpu-8gb", "cuda"),
+    ("amd2", {"gpu": "vulkan", "profile": "gpu-8gb"}, "gpu-8gb", "vulkan"),
     ("amd2", {"gpu": "cpu"}, "cpu", "cpu"),
     ("none", {"gpu": "auto"}, "cpu", "cpu"),
     ("none", {"gpu": "cpu", "profile": "cpu"}, "cpu", "cpu"),
-    ("amd2", {"gpu": "vulkan", "vision": True}, "gpu-large", "vulkan"),
+    ("amd2", {"gpu": "vulkan", "vision": True}, "gpu-12gb", "vulkan"),
 ]
 SECRET_SHAPES = [re.compile(p) for p in (r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", r"\b[0-9a-f]{32,}\b", r"gh[pousr]_[A-Za-z0-9]{20,}",
                                          r"-----BEGIN", r"\bsk-[A-Za-z0-9]{16,}")]
@@ -183,7 +183,8 @@ SECRET_SHAPES = [re.compile(p) for p in (r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8
 class ComposeRulesTests(unittest.TestCase):
     def check(self, mkind, choices, profile, kind):
         label = "%s %s" % (mkind, choices)
-        files, stack, comp = render(mkind, **dict(choices))
+        # the per-file rules are those of the plain file: a stamped pre-release tree would default to build sections (ReleaseTagTests)
+        files, stack, comp = render(mkind, **dict(choices, build=False))
         compose, env = files["docker-compose.yml"], files[".env"]
         self.assertEqual((stack["profile"], stack["gpu"]), (profile, kind), label)
         svcs = comp["services"]
@@ -322,7 +323,7 @@ class ComposeRulesTests(unittest.TestCase):
                 self.check(mkind, choices, profile, kind)
 
     def test_all_three_profiles_and_all_three_kinds_are_covered(self):
-        self.assertEqual({c[2] for c in CASES}, {"gpu-large", "gpu-small", "cpu"})
+        self.assertEqual({c[2] for c in CASES}, {"gpu-12gb", "gpu-8gb", "cpu"})
         self.assertEqual({c[3] for c in CASES}, {"vulkan", "cuda", "cpu"})
 
     def test_two_cards_get_their_own_pin(self):
@@ -361,7 +362,8 @@ class ComposeRulesTests(unittest.TestCase):
         self.assertEqual(inst.ENGINE_ROLE_ENV, {r: endpoints.SERVICES[r][1] for r in inst.ENGINE_ROLE_ENV})
 
     def test_native_argv_is_unchanged_by_the_refactor(self):
-        r = dict(inst.PROFILES["gpu-large"]["roles"]["coordinator"], name="coordinator", gpu=0)
+        r = dict(inst.PROFILES["gpu-12gb"]["roles"]["coordinator"], name="coordinator", gpu=0)
+        r.pop("draft")                       # the draft's flags sit between --model and --host: tested on their own (test_installer_ladder)
         r["files"] = [inst.MODELS[r["model"]]]
         argv = inst.engine_argv(r, "/opt/lodestone", 8)
         self.assertEqual(argv[:6], ["/opt/lodestone/bin/llama-server", "--model", "/opt/lodestone/models/Qwen3-14B-Q4_K_M.gguf",
@@ -380,11 +382,11 @@ class ChoiceTests(unittest.TestCase):
         for want in ("vulkan", "cuda"):
             _, stack, _ = render("none", gpu=want)
             self.assertEqual((stack["profile"], stack["gpu"]), ("cpu", "cpu"))
-            self.assertTrue(any("running on the CPU" in n for n in stack["notes"]), stack["notes"])
+            self.assertTrue(any("using the CPU" in n for n in stack["notes"]), stack["notes"])
 
     def test_forcing_a_gpu_profile_assumes_one_card_of_that_tier(self):
-        _, stack, _ = render("none", gpu="vulkan", profile="gpu-small")
-        self.assertEqual((stack["profile"], stack["gpu"]), ("gpu-small", "vulkan"))
+        _, stack, _ = render("none", gpu="vulkan", profile="gpu-8gb")
+        self.assertEqual((stack["profile"], stack["gpu"]), ("gpu-8gb", "vulkan"))
         self.assertEqual([r["name"] for r in stack["roles"]], ["coordinator", "embedder"])
         self.assertEqual(stack["roles"][0]["gpu"], 0)
 
@@ -405,9 +407,9 @@ class ChoiceTests(unittest.TestCase):
 
     def test_a_gpu_profile_on_a_cpu_stack_is_refused(self):
         with self.assertRaises(inst.InstallerError):
-            inst.docker_stack(machine("amd2"), {"gpu": "cpu", "profile": "gpu-large"})
+            inst.docker_stack(machine("amd2"), {"gpu": "cpu", "profile": "gpu-12gb"})
         with self.assertRaises(inst.InstallerError):
-            inst.docker_stack(machine("none"), {"gpu": "auto", "profile": "gpu-large"})
+            inst.docker_stack(machine("none"), {"gpu": "auto", "profile": "gpu-12gb"})
 
     def test_unknown_names_are_refused(self):
         with self.assertRaises(inst.InstallerError):
@@ -486,7 +488,7 @@ class WriteTests(unittest.TestCase):
         self.assertEqual(os.listdir(self.tmp), [])
 
     def test_a_bad_choice_exits_1_and_writes_nothing(self):
-        code, _ = self.run_main("--docker", "--gpu", "cpu", "--profile", "gpu-large", "--out", self.tmp)
+        code, _ = self.run_main("--docker", "--gpu", "cpu", "--profile", "gpu-12gb", "--out", self.tmp)
         self.assertEqual(code, 1)
         self.assertEqual(os.listdir(self.tmp), [])
 
@@ -516,6 +518,131 @@ class WriteTests(unittest.TestCase):
         self.assertTrue(any("DRY RUN" in l for l in lines))
 
 
+# ------------------------------------------------------------------------------- release tags and build sections ----
+RC = "v0.1.0-rc.2"
+
+
+class ReleaseTagTests(unittest.TestCase):
+    """Compose names images by version (never latest) and, while a release has no published images, builds them from GitHub."""
+
+    def render_with(self, tag, mkind="none", **choices):
+        with mock.patch.object(inst, "RELEASE_TAG", tag):
+            return render(mkind, **choices)
+
+    def test_which_tags_build_by_default(self):
+        self.assertTrue(inst.default_build("v0.1.0-rc.2"))
+        self.assertTrue(inst.default_build("v0.2.0-beta.1"))
+        self.assertTrue(inst.default_build(inst.UNSET_TAG))
+        self.assertFalse(inst.default_build("v0.1.0"))
+        self.assertEqual(inst.image_version("v0.1.0-rc.2"), "0.1.0-rc.2")
+        self.assertEqual(inst.image_version("0.1.0"), "0.1.0")
+
+    def test_the_release_tag_is_a_tag_or_the_placeholder(self):
+        # the monorepo carries the next final tag; a staged tree carries what the builder stamped (a tag, or the placeholder)
+        self.assertRegex(inst.RELEASE_TAG, r"^(v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?|%s)$" % inst.UNSET_TAG)
+        self.assertEqual(inst.UNSET_TAG, "UNSET-TAG")
+
+    def test_a_pre_release_builds_from_github_in_the_order_lodestone_stonesage_hearth(self):
+        files, stack, comp = self.render_with(RC)
+        self.assertTrue(stack["build"])
+        svcs = comp["services"]
+        ctx = lambda repo: "https://github.com/lottage/%s.git#%s" % (repo, RC)
+        for name in ("models", "gateway"):                      # the same image, the same build
+            self.assertEqual(svcs[name]["build"], {"context": ctx("lodestone")}, name)
+            self.assertEqual(svcs[name]["image"], "${LODESTONE_IMAGE:-ghcr.io/lottage/lodestone:0.1.0-rc.2}")
+        base = svcs["stonesage-image"]
+        self.assertEqual(base["image"], "ghcr.io/lottage/stonesage:0.1.0-rc.2")
+        self.assertEqual(base["build"], {"context": ctx("stonesage"),
+                                         "args": {"LODESTONE_PIP": "lodestone @ git+https://github.com/lottage/lodestone@" + RC}})
+        self.assertEqual((base["entrypoint"], base["restart"]), (["true"], "no"), "build only: it must exit at once")
+        hearth = svcs["stonesage"]
+        self.assertEqual(hearth["image"], "${STONESAGE_IMAGE:-ghcr.io/lottage/hearth:0.1.0-rc.2}")
+        self.assertEqual(hearth["build"], {"context": ctx("hearth"), "args": {"STONESAGE_IMAGE": "stonesage-image"},
+                                           "additional_contexts": {"stonesage-image": "service:stonesage-image"}})
+        self.assertEqual(hearth["depends_on"]["stonesage-image"], {"condition": "service_completed_successfully"})
+        order = list(svcs)
+        self.assertLess(order.index("stonesage-image"), order.index("stonesage"))
+        # every named context points at a service that is in the file
+        for body in svcs.values():
+            for ref in (body.get("build") or {}).get("additional_contexts", {}).values():
+                self.assertIn(ref.split(":", 1)[1], svcs)
+        env = dict(l.split("=", 1) for l in files[".env"].splitlines() if "=" in l and not l.startswith("#"))
+        self.assertEqual(env["LODESTONE_IMAGE"], "ghcr.io/lottage/lodestone:0.1.0-rc.2")
+        self.assertEqual(env["STONESAGE_IMAGE"], "ghcr.io/lottage/hearth:0.1.0-rc.2")
+        self.assertIn("docker compose up -d --build", files["docker-compose.yml"])
+
+    def test_no_file_ever_says_latest(self):
+        for tag in (RC, "v0.1.0", inst.UNSET_TAG):
+            for choices in ({}, {"build": True}, {"build": False}, {"stonesage": False}):
+                files, _s, _c = self.render_with(tag, **choices)
+                for name, text in files.items():
+                    self.assertNotIn(":latest", text, (tag, choices, name))
+                    self.assertNotRegex(text, r"(lodestone|stonesage|hearth):latest")
+
+    def test_a_published_release_pulls_by_version_without_build_sections(self):
+        files, stack, comp = self.render_with("v0.1.0")
+        self.assertFalse(stack["build"])
+        for name, body in comp["services"].items():
+            self.assertNotIn("build", body, name)
+        self.assertNotIn("stonesage-image", comp["services"])
+        self.assertEqual(comp["services"]["gateway"]["image"], "${LODESTONE_IMAGE:-ghcr.io/lottage/lodestone:0.1.0}")
+        self.assertEqual(comp["services"]["stonesage"]["image"], "${STONESAGE_IMAGE:-ghcr.io/lottage/hearth:0.1.0}")
+        self.assertIn("# Start:  docker compose up -d     Models", files["docker-compose.yml"])
+        self.assertNotIn("--build", files["docker-compose.yml"])
+
+    def test_the_choice_can_be_overridden_both_ways(self):
+        _f, stack, comp = self.render_with(RC, build=False)
+        self.assertFalse(stack["build"])
+        self.assertNotIn("build", comp["services"]["gateway"])
+        self.assertEqual(comp["services"]["gateway"]["image"], "${LODESTONE_IMAGE:-ghcr.io/lottage/lodestone:0.1.0-rc.2}")
+        _f, stack, comp = self.render_with("v0.1.0", build=True)
+        self.assertTrue(stack["build"])
+        self.assertEqual(comp["services"]["gateway"]["build"]["context"], "https://github.com/lottage/lodestone.git#v0.1.0")
+
+    def test_without_the_cockpit_only_the_lodestone_image_is_built(self):
+        _f, _s, comp = self.render_with(RC, stonesage=False)
+        self.assertNotIn("stonesage-image", comp["services"])
+        self.assertNotIn("stonesage", comp["services"])
+        self.assertIn("build", comp["services"]["gateway"])
+
+    def test_the_unstamped_placeholder_builds_and_names_itself(self):
+        files, stack, comp = self.render_with(inst.UNSET_TAG)
+        self.assertTrue(stack["build"])
+        self.assertIn("lodestone.git#UNSET-TAG", files["docker-compose.yml"])
+        self.assertIn("lodestone:UNSET-TAG", files[".env"])
+
+    def test_every_build_section_also_obeys_the_rules_of_a_plain_file(self):
+        """The per-file rules (no secrets, no LAN, every variable defaulted) hold for the build variant, with every GPU kind."""
+        for mkind, choices in (("none", {}), ("amd2", {"gpu": "vulkan"}), ("nvidia", {"gpu": "cuda"})):
+            files, stack, comp = self.render_with(RC, mkind, **choices)
+            text = files["docker-compose.yml"] + files[".env"]
+            self.assertNotRegex(text, r"\b(?:10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)\b")
+            for var, sep in re.findall(r"\$\{([A-Z_]+)(:-|\})", files["docker-compose.yml"]):
+                self.assertEqual(sep, ":-", "%s has no default" % var)
+            for pat in SECRET_SHAPES:
+                self.assertIsNone(pat.search(text), pat.pattern)
+
+    def test_main_builds_by_default_for_a_pre_release_and_prints_the_right_folder(self):
+        tmp = tempfile.mkdtemp(prefix="docker-build-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        out = []
+        with mock.patch.object(inst, "RELEASE_TAG", RC):
+            code = inst.main(["--docker", "--out", tmp], detected=machine("none"), out=out.append)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(any("release %s (built from GitHub on first start)" % RC in l for l in out), out)
+        nxt = [l for l in out if l.startswith("Next:")][0]
+        self.assertIn("docker compose up -d --build", nxt)
+        self.assertIn(os.path.abspath(tmp), nxt)
+        comp = load_yaml(slurp(os.path.join(tmp, "docker-compose.yml")))
+        self.assertIn("stonesage-image", comp["services"])
+        out = []
+        with mock.patch.object(inst, "RELEASE_TAG", RC):
+            inst.main(["--docker", "--no-build", "--out", tmp + "-b"], detected=machine("none"), out=out.append)
+        self.addCleanup(shutil.rmtree, tmp + "-b", True)
+        self.assertNotIn("--build", [l for l in out if l.startswith("Next:")][0])
+        self.assertNotIn("stonesage-image", load_yaml(slurp(os.path.join(tmp + "-b", "docker-compose.yml")))["services"])
+
+
 # ----------------------------------------------------------------------------------------------- with Docker, if any ----
 def docker_compose_available():
     if not shutil.which("docker"):
@@ -532,6 +659,22 @@ class RealComposeTests(unittest.TestCase):
         for mkind, choices, _profile, _kind in CASES:
             with self.subTest(machine=mkind, choices=choices):
                 files, _stack, _comp = render(mkind, **dict(choices))
+                with tempfile.TemporaryDirectory() as tmp:
+                    for name, text in files.items():
+                        with open(os.path.join(tmp, name), "w", encoding="utf-8", newline="\n") as f:
+                            f.write(text)
+                    done = subprocess.run(["docker", "compose", "--project-directory", tmp, "-f", os.path.join(tmp, "docker-compose.yml"),
+                                           "config", "--quiet"], capture_output=True, text=True, timeout=60)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+
+
+@unittest.skipUnless(docker_compose_available(), "docker compose is not installed here")
+class RealComposeBuildTests(unittest.TestCase):
+    def test_docker_compose_accepts_the_build_variant(self):
+        for mkind, choices in (("none", {}), ("nvidia", {"gpu": "cuda"})):
+            with self.subTest(machine=mkind):
+                with mock.patch.object(inst, "RELEASE_TAG", RC):
+                    files, _stack, _comp = render(mkind, **dict(choices))
                 with tempfile.TemporaryDirectory() as tmp:
                     for name, text in files.items():
                         with open(os.path.join(tmp, name), "w", encoding="utf-8", newline="\n") as f:

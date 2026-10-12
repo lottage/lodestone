@@ -2,9 +2,11 @@
 
     python -m lodestone.installer                       # review: detect the machine, print the plan, change nothing
     sudo python -m lodestone.installer --apply          # run it, step by step, stopping at the first failure
-    options: --profile auto|gpu-large|gpu-small|cpu   --prefix /opt/lodestone   --config PATH   --vision   --json
+    options: --profile auto|<tier>   --prefix /opt/lodestone   --config PATH   --vision   --json
+    python -m lodestone.installer --list-profiles       # the GPU ladder: which card gets which models
 
-    python -m lodestone.installer --docker [--gpu auto|vulkan|cuda|cpu] [--out DIR]     # the same plan as a Docker Compose stack
+    python -m lodestone.installer --docker [--gpu auto|vulkan|cuda|cpu] [--out DIR] [--build|--no-build]
+                                                         # the same plan as a Docker Compose stack
 
 Two ways in. Docker (below, "Docker") is for users on any OS that runs Docker; this file's native steps (the numbered list)
 are the bare-metal path: Ubuntu 24.04, systemd units, llama.cpp built from source.
@@ -22,9 +24,10 @@ What it does, in order (each step says why when printed):
                 already set is kept, the old file is copied to <file>.bak-<time> first
     8. start    systemctl enable --now, then wait for every /health
 
-Hardware: GPUs are driven through Vulkan (AMD, Intel and NVIDIA all have a Vulkan driver); no GPU, or one too small, means
-the CPU profile. The profile comes from the VRAM of the largest discrete GPU (`auto`) or from --profile. Every engine
-listens on 127.0.0.1 only; the gateway is the one address to expose (and it should get gateway.api_key first).
+Hardware: GPUs are driven through Vulkan (AMD, Intel and NVIDIA all have a Vulkan driver); no GPU, or one under 2 GB, means
+the CPU profile. The profile is a rung of the GPU ladder (PROFILES below, `--list-profiles`): the largest discrete GPU's VRAM
+picks the rung (`auto`), or --profile forces one, also on a card the probes cannot size. Every engine listens on 127.0.0.1
+only; the gateway is the one address to expose (and it should get gateway.api_key first).
 
 Design: detect() turns text (os-release, /proc/meminfo, `vulkaninfo --summary`, sysfs, nvidia-smi) into one dict through small
 pure parsers; plan() turns that dict into an ordered list of steps (data, nothing executed); apply() runs them, or only
@@ -63,50 +66,155 @@ LLAMA_CPP_URL = "https://github.com/ggml-org/llama.cpp"
 LLAMA_CPP_REF = "8b4b3558f1459c13e4aa38d5c94d306a00dc6acd"
 
 # --------------------------------------------------------------------------------------------------- the tables ----
-# Every model the installer can fetch: key -> Hugging Face repository + file name (checked against the repositories'
-# file lists 2026-10-10); size_bytes is what those files weighed then: it lets a re-run skip a finished download without
-# the network, and feeds the free-disk check. A stale size only costs one network check (the downloader asks the server).
+# Every model the installer can fetch: key -> Hugging Face repository + file name + size and SHA-256 as the repository's own
+# file list gives them (api/models/<repo>?blobs=true; re-checked 2026-10-12, all 10 files exist and match). size_bytes lets a
+# re-run skip a finished download without the network and feeds the free-disk check; sha256 is what `sha256sum -c` should
+# print for the file (model_downloader records the digest of what it fetched in SHA256SUMS; this table is the reference).
 MODELS: Dict[str, Dict[str, Any]] = {
-    "qwen3-14b-q4_k_m": {"repo": "Qwen/Qwen3-14B-GGUF", "file": "Qwen3-14B-Q4_K_M.gguf", "size_bytes": 9001752960},
-    "qwen3-8b-q4_k_m": {"repo": "Qwen/Qwen3-8B-GGUF", "file": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 5027783488},
+    "qwen3-32b-q4_k_m": {"repo": "Qwen/Qwen3-32B-GGUF", "file": "Qwen3-32B-Q4_K_M.gguf", "size_bytes": 19762149024,
+                         "sha256": "efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689"},
+    "qwen3-14b-q4_k_m": {"repo": "Qwen/Qwen3-14B-GGUF", "file": "Qwen3-14B-Q4_K_M.gguf", "size_bytes": 9001752960,
+                         "sha256": "500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0"},
+    "qwen3-8b-q4_k_m": {"repo": "Qwen/Qwen3-8B-GGUF", "file": "Qwen3-8B-Q4_K_M.gguf", "size_bytes": 5027783488,
+                        "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785"},
+    "qwen3-4b-q4_k_m": {"repo": "Qwen/Qwen3-4B-GGUF", "file": "Qwen3-4B-Q4_K_M.gguf", "size_bytes": 2497280256,
+                        "sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"},
+    "qwen3-0.6b-q8_0": {"repo": "Qwen/Qwen3-0.6B-GGUF", "file": "Qwen3-0.6B-Q8_0.gguf", "size_bytes": 639446688,
+                        "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"},
     "granite-4.0-h-tiny-q4_k_m": {"repo": "ibm-granite/granite-4.0-h-tiny-GGUF", "file": "granite-4.0-h-tiny-Q4_K_M.gguf",
-                                  "size_bytes": 4230976352},
+                                  "size_bytes": 4230976352,
+                                  "sha256": "5a38b08c441ae1adbafb1d2b8a7167e0d48734d83af68b268cefea1eec553dcd"},
     "qwen2.5-coder-3b-q5_k_m": {"repo": "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF", "file": "qwen2.5-coder-3b-instruct-q5_k_m.gguf",
-                                "size_bytes": 2438740416},
+                                "size_bytes": 2438740416,
+                                "sha256": "eb863f2a1a9b67e33bbf2dad98ea09c03b71c8052aeb4835171cf6f7a7a12db4"},
     "bge-large-en-v1.5-f16": {"repo": "CompendiumLabs/bge-large-en-v1.5-gguf", "file": "bge-large-en-v1.5-f16.gguf",
-                              "size_bytes": 669603712},
+                              "size_bytes": 669603712,
+                              "sha256": "3379a0e9cea28fc6d7136df8ea7a88ef99ccce5963b9a6f7af9609997be762e3"},
     "qwen2.5-vl-7b-q4_k_m": {"repo": "ggml-org/Qwen2.5-VL-7B-Instruct-GGUF", "file": "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
-                             "size_bytes": 4683072032},
+                             "size_bytes": 4683072032,
+                             "sha256": "9258bf05b12686d097ff3b6b18d968ab393649780aa2b3cd67fec43d50554392"},
     "qwen2.5-vl-7b-mmproj-f16": {"repo": "ggml-org/Qwen2.5-VL-7B-Instruct-GGUF",
-                                 "file": "mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf", "size_bytes": 1354162912},
+                                 "file": "mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf", "size_bytes": 1354162912,
+                                 "sha256": "c24a7f5fcfc68286f0a217023b6738e73bea4f11787a43e8238d4bb1b8604cde"},
 }
 
-# Roles per profile. vram_mb is the room the engine needs at these settings (weights + KV cache + compute buffers,
-# measured on the project's engines, rounded up); fallback says what happens when no GPU has that much left:
-# "cpu" runs it on the CPU, "omit" leaves the role out. kind: chat | embedding | vision.
+# ---- the GPU ladder ----
+# One rung per common card size; the largest discrete GPU's VRAM picks the rung (the biggest `min_vram_mb` it reaches).
+# HEADROOM, the arithmetic: a role's `vram_mb` is the room it needs (weights + KV cache + compute buffers); place_roles plans
+# only VRAM_MARGIN (95 %) of a card, the rest being the driver's context and fragmentation. A rung's `min_vram_mb` is the
+# marketed size minus ~4 % (cards report a little under their name: a "12 GB" card reads 11.9 to 12.3 GB, a "4 GB" one 4.0)
+# and the rung's coordinator must fit in min x 0.95 (a test checks every rung). KV cache per token = layers x 2 x KV heads x
+# head_dim x bytes per element (q8_0 1.06, q4_0 0.56); the numbers are from each model's config.json: Qwen3-4B 36 layers,
+# 8 KV heads, 128 head_dim; Qwen3-14B 40/8/128; Qwen3-32B 64/8/128; Granite 4.0 h-tiny 40 layers of which only 4 are attention
+# (its cache is tiny, the rest is mamba state). Role keys: `ngl` = layers on the GPU (default 99 = all; fewer = partial
+# offload, the rest runs on the CPU), `draft` = a small model for speculative decoding, `fallback` = what happens when no GPU
+# has the room left: "cpu" runs the role on the CPU, "omit" leaves it out, None = the install stops. kind: chat | embedding |
+# vision. A figure marked "measured" was measured on the project's own engines; the others are arithmetic and say so.
+_EMBEDDER: Dict[str, Any] = {"kind": "embedding", "model": "bge-large-en-v1.5-f16", "port": 8003, "ctx": 512,
+                             "vram_mb": 600, "fallback": "cpu"}
+_WORKER: Dict[str, Any] = {"kind": "chat", "model": "qwen2.5-coder-3b-q5_k_m", "port": 8002, "ctx": 8192, "parallel": 2,
+                           "kv": "q8_0", "batch": (2048, 512), "vram_mb": 2350, "fallback": "omit"}
+_COORD_14B: Dict[str, Any] = {   # measured on an RX 6750 XT: 8.96 GB with the draft, ~41 tok/s, Computer's tool eval 45/46
+    "kind": "chat", "model": "qwen3-14b-q4_k_m", "draft": "qwen3-0.6b-q8_0", "port": 8001, "ctx": 12288, "parallel": 2,
+    "kv": "q4_0", "batch": (2048, 1024), "vram_mb": 8960, "fallback": None}
+_GRANITE: Dict[str, Any] = {     # measured on an RX 6600: 4.2 GB, 75 tok/s; tool eval 44/46 single, 41/46 mid, 0 wrong actions
+    "kind": "chat", "model": "granite-4.0-h-tiny-q4_k_m", "port": 8001, "ctx": 8192, "parallel": 1, "kv": "q8_0",
+    "batch": (2048, 512), "vram_mb": 4300, "fallback": None}
+
 PROFILES: Dict[str, Dict[str, Any]] = {
-    "gpu-large": {      # largest GPU >= 11.5 GB (12 GB cards report a little under 12 GiB)
-        "min_vram_mb": 11500,
+    "gpu-24gb": {
+        "min_vram_mb": 23000, "examples": "RTX 3090 / 4090, RX 7900 XTX, RTX A5000",
+        "speed": "not measured",
+        "note": "Qwen3-32B Q4_K_M (18.4 GiB of weights + 0.6 GiB KV at 8192 tokens, q4_0, one slot + ~0.6 GiB buffers = "
+                "~20 GB of the 22 GB the margin allows) plus the embedder. Chosen over 14B at Q8_0 + vision because the extra "
+                "VRAM buys the most as model quality (the 14B is already the proven size; 32B is the next Qwen3 step); "
+                "vision stays one flag away on a second card or via --profile gpu-16gb. NOT measured: the 32B has not been "
+                "run against Computer's tool eval.",
         "roles": {
-            "coordinator": {"kind": "chat", "model": "qwen3-14b-q4_k_m", "port": 8001, "ctx": 12288, "parallel": 2,
-                            "kv": "q4_0", "batch": (2048, 1024), "vram_mb": 8400, "fallback": None},
-            "worker": {"kind": "chat", "model": "qwen2.5-coder-3b-q5_k_m", "port": 8002, "ctx": 8192, "parallel": 2,
-                       "kv": "q8_0", "batch": (2048, 512), "vram_mb": 2350, "fallback": "omit"},
-            "embedder": {"kind": "embedding", "model": "bge-large-en-v1.5-f16", "port": 8003, "ctx": 512,
-                         "vram_mb": 600, "fallback": "cpu"},
+            "coordinator": {"kind": "chat", "model": "qwen3-32b-q4_k_m", "port": 8001, "ctx": 8192, "parallel": 1,
+                            "kv": "q4_0", "batch": (2048, 512), "vram_mb": 20200, "fallback": None},
+            "embedder": dict(_EMBEDDER),
         },
     },
-    "gpu-small": {      # 7.5 to 11.5 GB: one 8B chat model, nothing else competing for the card
-        "min_vram_mb": 7500,
+    "gpu-16gb": {
+        "min_vram_mb": 15500, "examples": "RTX 4060 Ti 16 GB, 4070 Ti Super, 4080, RTX A4000, RX 6800 / 6900 / 7800 XT",
+        "speed": "~41 tok/s for the 14B on an RX 6750 XT (same engine as gpu-12gb)",
+        "note": "The 12 GB stack's 14B (+ draft, 9.0 GB) with the vision model co-resident (Qwen2.5-VL-7B Q4_K_M + mmproj f16, "
+                "6.4 GB measured): 8960 + 6500 = 15.5 GB, so the embedder runs on the CPU (a second card takes it) and "
+                "there is no worker. Vision rather than a longer context: 12288 tokens x 2 slots already "
+                "holds Computer's prompt with room, while the cameras are what a house needs next.",
+        "roles": {
+            "coordinator": dict(_COORD_14B),
+            "vision": {"kind": "vision", "model": "qwen2.5-vl-7b-q4_k_m", "mmproj": "qwen2.5-vl-7b-mmproj-f16", "port": 8004,
+                       "ctx": 4096, "parallel": 1, "vram_mb": 6500, "fallback": "omit"},
+            "embedder": dict(_EMBEDDER),
+        },
+    },
+    "gpu-12gb": {       # the old "gpu-large"
+        "min_vram_mb": 11500, "examples": "RTX 3060 12 GB, RTX 4070 / 4070 Ti, RX 6700 XT / 6750 XT, Arc B580",
+        "speed": "~41 tok/s (RX 6750 XT, measured); Computer's tool eval 45/46",
+        "note": "Qwen3-14B Q4_K_M with the Qwen3-0.6B draft (speculative decoding), KV q4_0, two slots of 6144 tokens: 9.0 GB "
+                "measured. The 3B code worker takes the next 2.3 GB; on a single 12 GB card that leaves 0.3 GB, so the embedder "
+                "(0.6 GB) runs on the CPU there (a second card takes it); a card under 11.9 GB loses the worker instead.",
+        "roles": {
+            "coordinator": dict(_COORD_14B),
+            "worker": dict(_WORKER),
+            "embedder": dict(_EMBEDDER),
+        },
+    },
+    "gpu-8gb": {        # the old "gpu-small"
+        "min_vram_mb": 7500, "examples": "RTX 3060 Ti / 3070 / 4060, RX 6600 / 7600, Arc A750",
+        "speed": "not measured",
+        "note": "One 8B chat model (Qwen3-8B Q4_K_M, 5.0 GB, KV q8_0, 8192 tokens, one slot: ~6.3 GB) and the embedder; "
+                "nothing else competes for the card. Granite 4.0 h-tiny (next rung down) is smaller and was the best small "
+                "model in Computer's eval; the 8B stays here because the headroom lets it be the stronger reader.",
         "roles": {
             "coordinator": {"kind": "chat", "model": "qwen3-8b-q4_k_m", "port": 8001, "ctx": 8192, "parallel": 1,
                             "kv": "q8_0", "batch": (2048, 512), "vram_mb": 6300, "fallback": None},
-            "embedder": {"kind": "embedding", "model": "bge-large-en-v1.5-f16", "port": 8003, "ctx": 512,
-                         "vram_mb": 600, "fallback": "cpu"},
+            "embedder": dict(_EMBEDDER),
+        },
+    },
+    "gpu-6gb": {
+        "min_vram_mb": 5500, "examples": "GTX 1060 6 GB, RTX 2060, RTX 3060 laptop 6 GB, RX 5600 XT",
+        "speed": "75 tok/s (RX 6600, measured)",
+        "note": "Granite 4.0 h-tiny Q4_K_M fully offloaded (4.2 GB measured; a mixture-of-experts model with ~1B active "
+                "parameters) and the embedder: 4300 + 600 = 4.9 GB of the 5.2 GB the margin allows. The best small model "
+                "tested: Computer's tool eval 44/46 single, 41/46 mid-conversation, 0 wrong actions.",
+        "roles": {
+            "coordinator": dict(_GRANITE),
+            "embedder": dict(_EMBEDDER),
+        },
+    },
+    "gpu-4gb": {
+        "min_vram_mb": 3500, "examples": "GTX 1650, RTX 3050 4 GB laptop, Quadro M2000 / P1000 / T1000, RX 6400 / 6500 XT",
+        "speed": "13.1 tok/s through the gateway (Quadro M2000, measured 2026-10-11)",
+        "note": "Qwen3-4B Q4_K_M fully offloaded: 2.3 GiB of weights + 0.45 GiB KV (6144 tokens, q8_0, one slot) + ~0.3 GiB "
+                "buffers (batch 1024 / 256 keeps the logits buffer small) = ~3.1 GiB, planned as 3300 MB of the 3325 MB the "
+                "margin allows at the rung's minimum. On a 4 GB card the embedder does not fit beside it and runs on the CPU. Granite h-tiny does not fit whole "
+                "(4.2 GB), but a partial offload of it is the candidate to try next (not measured).",
+        "roles": {
+            "coordinator": {"kind": "chat", "model": "qwen3-4b-q4_k_m", "port": 8001, "ctx": 6144, "parallel": 1,
+                            "kv": "q8_0", "batch": (1024, 256), "vram_mb": 3300, "fallback": None},
+            "embedder": dict(_EMBEDDER),
+        },
+    },
+    "gpu-2gb": {
+        "min_vram_mb": 1900, "examples": "GT 1030, GTX 1050 2 GB, GTX 1060 3 GB, MX150 / MX250 laptop GPUs",
+        "speed": "not measured (partial offload: the CPU's speed, a little better)",
+        "note": "Granite 4.0 h-tiny Q4_K_M with 12 of its 40 layers on the card (~1.3 GB of weights + buffers = 1.6 GB of the "
+                "1.8 GB the margin allows at the rung's minimum); the other 28 layers and the embedder run on the CPU. Chosen "
+                "over Qwen3-4B (partly offloaded) and Qwen3-1.7B (whole) for tool-calling quality: Granite scored 44/46 on "
+                "Computer's tool eval on a CPU against 42/46 for Qwen3-4B, with no answers invented from nothing, and a "
+                "partly offloaded model is still faster than none. NOT measured on a 2 GB card.",
+        "roles": {
+            "coordinator": dict(_GRANITE, ngl=12, vram_mb=1600),
+            "embedder": dict(_EMBEDDER, vram_mb=0, cpu_only=True),
         },
     },
     "cpu": {            # no usable GPU: a small mixture-of-experts model that decodes well on a CPU
-        "min_vram_mb": 0,
+        "min_vram_mb": 0, "examples": "no GPU, integrated graphics, a card under 2 GB",
+        "speed": "20-40 tok/s on a modern desktop CPU (Granite: 35 on an i7-12700K, measured); a few on an old server CPU",
+        "note": "Granite 4.0 h-tiny Q4_K_M and the embedder, both on the CPU.",
         "roles": {
             "coordinator": {"kind": "chat", "model": "granite-4.0-h-tiny-q4_k_m", "port": 8001, "ctx": 8192,
                             "parallel": 1, "kv": "q8_0", "batch": (2048, 512), "vram_mb": 0, "fallback": None,
@@ -116,6 +224,8 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         },
     },
 }
+# Old names, so earlier commands and the profile recorded in a config still work.
+PROFILE_ALIASES = {"gpu-large": "gpu-12gb", "gpu-small": "gpu-8gb"}
 # Optional (--vision): needs a GPU of its own with this much room left, else it is left out with a note.
 VISION_ROLE: Dict[str, Any] = {"kind": "vision", "model": "qwen2.5-vl-7b-q4_k_m", "mmproj": "qwen2.5-vl-7b-mmproj-f16",
                                "port": 8004, "ctx": 4096, "parallel": 1, "vram_mb": 6500, "fallback": "omit"}
@@ -239,9 +349,9 @@ def read_drm(root: str = "/sys/class/drm", read: Callable[[str], Optional[str]] 
     return out
 
 
-def merge_gpus(vulkan: List[Dict[str, Any]], drm: List[Dict[str, Any]], nvidia: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Real GPUs (the software renderer is dropped) with their VRAM, from sysfs (matched on vendor and device id, so two
-    identical cards pair up in order) or, for NVIDIA's proprietary driver, from nvidia-smi (in order). vram_mb None = unknown."""
+def _merge(vulkan: List[Dict[str, Any]], drm: List[Dict[str, Any]], nvidia: List[Dict[str, Any]]
+           ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """(gpus, sysfs cards no Vulkan device matched, nvidia-smi cards no Vulkan device matched). See merge_gpus."""
     drm_left, smi_left = list(drm), list(nvidia)
     gpus = []
     for dev in vulkan:
@@ -257,7 +367,33 @@ def merge_gpus(vulkan: List[Dict[str, Any]], drm: List[Dict[str, Any]], nvidia: 
         gpus.append({"index": dev["index"], "name": dev["name"] or UNKNOWN, "vendor": VENDORS.get(dev["vendor_id"], UNKNOWN),
                      "type": dev["type"], "driver": dev["driver"], "vram_mb": vram, "vram_source": source,
                      "integrated": dev["type"] == "integrated"})
-    return gpus
+    return gpus, drm_left, smi_left
+
+
+def merge_gpus(vulkan: List[Dict[str, Any]], drm: List[Dict[str, Any]], nvidia: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Real GPUs (the software renderer is dropped) with their VRAM, from sysfs (matched on vendor and device id, so two
+    identical cards pair up in order) or, for NVIDIA's proprietary driver, from nvidia-smi (in order). vram_mb None = unknown."""
+    return _merge(vulkan, drm, nvidia)[0]
+
+
+VENDOR_NAMES = {"amd": "AMD", "nvidia": "NVIDIA", "intel": "Intel"}
+
+
+def build_cards(gpus: List[Dict[str, Any]], drm_left: List[Dict[str, Any]], smi_left: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Every card any probe found, once: {name, vendor, vram_mb (None = unknown), source (where the size came from: nvidia-smi |
+    sysfs | vulkan = listed by Vulkan with no size), integrated, vulkan (True = Vulkan lists it, so the native install can use
+    it), index (its Vulkan index)}. The Vulkan devices come first, then the cards only nvidia-smi or sysfs know (a host
+    without vulkaninfo, or an NVIDIA driver without its Vulkan part): they are named, never lost."""
+    cards = [{"name": g["name"], "vendor": g["vendor"], "vram_mb": g["vram_mb"],
+              "source": g["vram_source"] if g["vram_mb"] else "vulkan", "integrated": g["integrated"], "vulkan": True,
+              "index": g["index"]} for g in gpus]
+    cards += [{"name": s["name"], "vendor": "nvidia", "vram_mb": s["vram_mb"], "source": "nvidia-smi", "integrated": False,
+               "vulkan": False, "index": None} for s in smi_left]
+    for x in drm_left:
+        vendor = VENDORS.get(x["vendor_id"], UNKNOWN)
+        cards.append({"name": "%s GPU (device 0x%04x)" % (VENDOR_NAMES.get(vendor, "Unknown"), x["device_id"]), "vendor": vendor,
+                      "vram_mb": x["vram_mb"], "source": "sysfs", "integrated": False, "vulkan": False, "index": None})
+    return cards
 
 
 # --------------------------------------------------------------------------------------------------- detection ----
@@ -301,7 +437,8 @@ def detect(sources: Optional[Dict[str, Any]] = None, prefix: str = DEFAULT_PREFI
     s = sources if sources is not None else gather(prefix, config_path)
     osr = parse_os_release(s.get("os_release"))
     vulkan_text = s.get("vulkaninfo")
-    gpus = merge_gpus(parse_vulkaninfo_summary(vulkan_text), s.get("drm") or [], parse_nvidia_smi(s.get("nvidia_smi")))
+    gpus, drm_left, smi_left = _merge(parse_vulkaninfo_summary(vulkan_text), s.get("drm") or [],
+                                      parse_nvidia_smi(s.get("nvidia_smi")))
     version = parse_llama_version(s.get("llama_server_version"))
     system = s.get("system") or UNKNOWN
     return {
@@ -310,21 +447,38 @@ def detect(sources: Optional[Dict[str, Any]] = None, prefix: str = DEFAULT_PREFI
         "cpu_count": s.get("cpu_count"), "ram_mb": parse_meminfo(s.get("meminfo")),
         "euid": s.get("euid"), "is_root": (s.get("euid") == 0) if s.get("euid") is not None else None,
         "vulkan": UNKNOWN if vulkan_text is None else ("ok" if gpus else "no-gpu"),
-        "gpus": gpus, "nvidia": parse_nvidia_smi(s.get("nvidia_smi")),
+        "gpus": gpus, "cards": build_cards(gpus, drm_left, smi_left), "nvidia": parse_nvidia_smi(s.get("nvidia_smi")),
         "llama_server": ({"path": s["llama_server_path"], **(version or {"build": None, "commit": None})}
                          if s.get("llama_server_path") else None),
         "disk_free_mb": s.get("disk_free_mb"), "config": s.get("config"),
     }
 
 
+def gb(vram_mb: Optional[int]) -> str:
+    return ("%.1f GB" % (vram_mb / 1024)) if vram_mb else "VRAM unknown"
+
+
+def cards_of(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """d["cards"] (detect() makes it); for a hand-made dict that has only "gpus", the same cards built from those."""
+    if d.get("cards") is not None:
+        return d["cards"]
+    return [{"name": g["name"], "vendor": g["vendor"], "vram_mb": g["vram_mb"],
+             "source": g.get("vram_source") if g["vram_mb"] else "vulkan", "integrated": g["integrated"], "vulkan": True,
+             "index": g["index"]} for g in d["gpus"]]
+
+
 def describe(d: Dict[str, Any]) -> List[str]:
-    gpu = ["  GPU %d: %s, %s" % (g["index"], g["name"], ("%.1f GB" % (g["vram_mb"] / 1024)) if g["vram_mb"] else "VRAM unknown"
-                                 ) + (" (integrated)" if g["integrated"] else "") for g in d["gpus"]]
+    cards = cards_of(d)
+    gpu = ["  %s, %s (%s%s)%s" % (c["name"], gb(c["vram_mb"]), c["source"], "" if c["vulkan"] else "; Vulkan does not list it",
+                                  " (integrated)" if c["integrated"] else "") for c in cards]
     ls = d["llama_server"]
+    vulkan = {"ok": "ok", "no-gpu": "installed, lists no GPU", UNKNOWN: "not installed (vulkaninfo missing)"}[d["vulkan"]]
     return ["machine:  %s %s, %s, %s" % (d["system"], d["machine"], d["os"]["pretty"],
                                           ("root" if d["is_root"] else "not root") if d["is_root"] is not None else "root unknown"),
             "cpu/ram:  %s threads, %s" % (d["cpu_count"] or UNKNOWN, ("%.1f GB" % (d["ram_mb"] / 1024)) if d["ram_mb"] else UNKNOWN),
-            "vulkan:   %s" % d["vulkan"]] + (gpu or ["  no GPU found"]) + [
+            "vulkan:   %s" % vulkan,
+            "gpus:     %s" % (("%d found (name, VRAM, where the size came from)" % len(cards)) if cards else
+                              "none found (looked at nvidia-smi, sysfs and vulkaninfo)")] + gpu + [
             "llama-server: %s" % (("%s (build %s)" % (ls["path"], ls["build"] or UNKNOWN)) if ls else "not installed")]
 
 
@@ -335,25 +489,124 @@ def usable_gpus(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [g for g in d["gpus"] if g["vram_mb"] and not g["integrated"]]
 
 
-def choose_profile(d: Dict[str, Any], requested: str = "auto") -> str:
-    if requested != "auto":
-        if requested not in PROFILES:
-            raise InstallerError("unknown profile %r (choose from auto, %s)" % (requested, ", ".join(PROFILES)))
-        return requested
-    best = max((g["vram_mb"] for g in usable_gpus(d)), default=0)
-    for name in ("gpu-large", "gpu-small"):
-        if best >= PROFILES[name]["min_vram_mb"]:
+def canonical_profile(name: str) -> str:
+    """A profile name as PROFILES spells it (the old gpu-large / gpu-small map to gpu-12gb / gpu-8gb); InstallerError if unknown."""
+    name = PROFILE_ALIASES.get(name, name)
+    if name not in PROFILES:
+        raise InstallerError("unknown profile %r (choose from auto, %s; see --list-profiles)" % (name, ", ".join(PROFILES)))
+    return name
+
+
+def profile_choices() -> List[str]:
+    """What --profile accepts."""
+    return ["auto"] + list(PROFILES) + list(PROFILE_ALIASES)
+
+
+def tier_for(vram_mb: Optional[int]) -> str:
+    """The rung of the ladder a card of this size reaches (the highest rung whose minimum it meets); cpu under the lowest."""
+    for name, p in PROFILES.items():                      # largest first
+        if name != "cpu" and vram_mb and vram_mb >= p["min_vram_mb"]:
             return name
     return "cpu"
 
 
+MIN_GPU_MB = PROFILES["gpu-2gb"]["min_vram_mb"]
+
+
+def explain_profile(cards: List[Dict[str, Any]], requested: str = "auto") -> Tuple[str, List[str]]:
+    """(profile, notes). auto: the largest usable card sets the rung. A card is usable when it is discrete, its VRAM is
+    known and (unless the row says vulkan=False) Vulkan lists it. Every card gets a note that names it with its size and says
+    what became of it: "found Quadro M2000, 4.0 GB -> gpu-4gb", "found GT 710, 1.0 GB: below the 2 GB minimum, using the
+    CPU". `requested` other than auto is returned as given (canonical name), whatever the cards are."""
+    if requested != "auto":
+        return canonical_profile(requested), []
+    usable = [c for c in cards if c.get("vulkan", True) and not c.get("integrated") and c.get("vram_mb")]
+    best = max(usable, key=lambda c: c["vram_mb"], default=None)
+    profile = tier_for(best["vram_mb"]) if best else "cpu"
+    if not cards:
+        return profile, ["no GPU found (looked at nvidia-smi, sysfs and vulkaninfo): using the CPU"]
+    notes: List[str] = []
+    for c in cards:
+        label = "%s, %s" % (c["name"], gb(c["vram_mb"])) if c.get("vram_mb") else c["name"]
+        if c.get("integrated"):
+            notes.append("found %s (integrated graphics share system RAM): not used" % label)
+        elif not c.get("vram_mb"):
+            notes.append("found %s: VRAM size unknown, not used (if you know the card, name its rung: --profile gpu-8gb, "
+                         "for example; see --list-profiles)" % c["name"])
+        elif not c.get("vulkan", True):
+            notes.append("found %s (%s): Vulkan does not list it, so the native install cannot use it (install the vendor's "
+                         "Vulkan driver, or use --docker, which can use an NVIDIA card through CUDA)%s"
+                         % (label, c.get("source") or UNKNOWN, ", using the CPU" if profile == "cpu" else ""))
+        elif c["vram_mb"] < MIN_GPU_MB:
+            notes.append("found %s: below the %d GB minimum, %s" % (label, round(MIN_GPU_MB / 1000),
+                                                                   "using the CPU" if profile == "cpu" else "not used"))
+        elif c is best:
+            notes.append("found %s -> %s" % (label, profile))
+        else:
+            notes.append("found %s (second card: takes the jobs that do not fit next to the main model)" % label)
+    return profile, notes
+
+
+def choose_profile(d: Dict[str, Any], requested: str = "auto") -> str:
+    return explain_profile(cards_of(d), requested)[0]
+
+
+def profile_notes(d: Dict[str, Any], requested: str = "auto") -> List[str]:
+    return explain_profile(cards_of(d), requested)[1]
+
+
+def ladder_rows() -> List[Dict[str, Any]]:
+    """The ladder for --list-profiles, largest first: {name, min_vram_mb, max_vram_mb (None = no upper bound), examples, speed,
+    models (one line per role), note}."""
+    names = list(PROFILES)
+    rows = []
+    for i, name in enumerate(names):
+        p = PROFILES[name]
+        upper = PROFILES[names[i - 1]]["min_vram_mb"] if i else None
+        roles = []
+        for rname, r in p["roles"].items():
+            if r.get("cpu_only") or r["vram_mb"] == 0:
+                where = "CPU"
+            elif r.get("ngl"):
+                where = "%d layers on the GPU, the rest on the CPU" % r["ngl"]
+            else:
+                where = "GPU"
+            keys = [r["model"]] + ([r["mmproj"]] if r.get("mmproj") else []) + ([r["draft"]] if r.get("draft") else [])
+            m = " + ".join(MODELS[k]["file"] + (" (draft)" if k == r.get("draft") else "") for k in keys)
+            roles.append("%s: %s, %.1f GB [%s]" % (rname, m, sum(MODELS[k]["size_bytes"] for k in keys) / 1e9, where))
+        rows.append({"name": name, "min_vram_mb": p["min_vram_mb"], "max_vram_mb": upper, "examples": p["examples"],
+                     "speed": p["speed"], "models": roles, "note": p["note"]})
+    return rows
+
+
+def format_ladder(out: Callable[[str], None] = print) -> None:
+    out("GPU profiles: the largest GPU's VRAM picks the rung (--profile auto); --profile <name> forces one.")
+    out("Old names still work: %s." % ", ".join("%s = %s" % kv for kv in PROFILE_ALIASES.items()))
+    for r in ladder_rows():
+        lo, hi = (round(v / 500.0) / 2.0 if v else None for v in (r["min_vram_mb"], r["max_vram_mb"]))    # 1900 -> "2", 11500 -> "11.5"
+        if r["name"] == "cpu":
+            rng = "no GPU, or one under 2 GB"
+        elif hi is None:
+            rng = "%g GB and up" % lo
+        else:
+            rng = "%g to %g GB" % (lo, hi)
+        out("")
+        out("%s  (%s)" % (r["name"], rng))
+        out("  cards:  %s" % r["examples"])
+        for m in r["models"]:
+            out("  %s" % m)
+        out("  speed:  %s" % r["speed"])
+        out("  why:    %s" % r["note"])
+
+
 def place_roles(profile: str, d: Dict[str, Any], vision: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
     """(roles, notes): each role = its table entry plus name, gpu (the Vulkan index it is pinned to, None = CPU) and
-    model files. Greedy by size: the coordinator takes the largest GPU, each later role the GPU with the most room left
+    model files. Greedy: the coordinator takes the largest GPU, each later role the GPU with the most room left
     (VRAM_MARGIN of each card is all that may be planned), else its fallback (CPU, or left out)."""
+    profile = canonical_profile(profile)
     spec = {name: dict(r) for name, r in PROFILES[profile]["roles"].items()}
     notes: List[str] = []
-    if vision:
+    if vision and "vision" not in spec:
         if profile == "cpu":
             notes.append("vision skipped: it needs a GPU")
         else:
@@ -378,7 +631,7 @@ def place_roles(profile: str, d: Dict[str, Any], vision: bool = False) -> Tuple[
             elif r["fallback"] is None:
                 big = max((g["vram_mb"] for g in gpus), default=0)
                 raise InstallerError("the %s needs about %.1f GB of VRAM and the largest GPU has %.1f GB: use --profile %s"
-                                     % (name, r["vram_mb"] / 1024, big / 1024, "gpu-small" if profile == "gpu-large" else "cpu"))
+                                     % (name, r["vram_mb"] / 1024, big / 1024, tier_for(big)))
             elif r["fallback"] == "omit":
                 notes.append("%s left out: no GPU has %.1f GB free" % (name, r["vram_mb"] / 1024))
                 continue
@@ -386,7 +639,8 @@ def place_roles(profile: str, d: Dict[str, Any], vision: bool = False) -> Tuple[
                 notes.append("%s runs on the CPU: no GPU has %.1f GB free" % (name, r["vram_mb"] / 1024))
         roles.append(r)
     for r in roles:
-        r["files"] = [MODELS[r["model"]]] + ([MODELS[r["mmproj"]]] if r.get("mmproj") else [])
+        r["files"] = [MODELS[r["model"]]] + ([MODELS[r["mmproj"]]] if r.get("mmproj") else []) + (
+            [MODELS[r["draft"]]] if r.get("draft") else [])
     return roles, notes
 
 
@@ -404,8 +658,27 @@ CPU_EXPECTATION = [
 ]
 
 
+PARTIAL_EXPECTATION = [
+    "Partial-offload profile: the card is too small to hold the language model, so only some of its layers run on the GPU and",
+    "  the rest on the processor. Expect about the speed of the CPU profile, a little better; a first reply that reads a long",
+    "  prompt can take a minute or more. Waits for the model are lengthened to match. A card of 4 GB or more runs a model whole.",
+]
+
+
 def coordinator_on_cpu(roles: List[Dict[str, Any]]) -> bool:
-    return any(r["name"] == "coordinator" and r["gpu"] is None for r in roles)
+    """True when the language model is slow enough to need longer waits: it runs on the CPU, or only partly on a GPU."""
+    return any(r["name"] == "coordinator" and (r["gpu"] is None or r.get("ngl", 99) < 99) for r in roles)
+
+
+def expectation_lines(roles: List[Dict[str, Any]]) -> List[str]:
+    """What to tell the person when the language model is not whole on a GPU ([] when it is)."""
+    for r in roles:
+        if r["name"] == "coordinator":
+            if r["gpu"] is None:
+                return CPU_EXPECTATION
+            if r.get("ngl", 99) < 99:
+                return PARTIAL_EXPECTATION
+    return []
 
 
 def engine_argv(role: Dict[str, Any], prefix: str, threads: int, *, backend: str = "vulkan", host: str = ENGINE_HOST,
@@ -417,12 +690,18 @@ def engine_argv(role: Dict[str, Any], prefix: str, threads: int, *, backend: str
     a = [prefix + "/bin/llama-server"] if binary else []
     a += ["--model", "%s/%s" % (mdir, role["files"][0]["file"])]
     if role.get("mmproj"):
-        a += ["--mmproj", "%s/%s" % (mdir, role["files"][1]["file"])]
+        a += ["--mmproj", "%s/%s" % (mdir, MODELS[role["mmproj"]]["file"])]
+    if role.get("draft"):       # speculative decoding: the flags of the live coordinator unit (a small model drafts, the big one checks)
+        a += ["--spec-draft-model", "%s/%s" % (mdir, MODELS[role["draft"]]["file"]), "--spec-draft-n-max", "12",
+              "--spec-draft-n-min", "2", "--spec-draft-p-min", "0.65", "--spec-draft-ngl", "99"]
     a += ["--host", host, "--port", str(role["port"])]
     if role["gpu"] is None:
         a += ["--device", "none", "-t", str(2 if role["kind"] == "embedding" else threads)]
     else:
-        a += ["--device", "CUDA0" if backend == "cuda" else "Vulkan0", "-ngl", "99"]
+        ngl = role.get("ngl", 99)
+        a += ["--device", "CUDA0" if backend == "cuda" else "Vulkan0", "-ngl", str(ngl)]
+        if ngl < 99:            # partial offload: the layers left on the CPU need threads
+            a += ["-t", str(threads)]
     if role["kind"] == "embedding":
         a += ["--embedding", "-c", str(role["ctx"]), "-b", str(role["ctx"]), "-ub", str(role["ctx"])]
     else:
@@ -849,8 +1128,15 @@ def apply(steps: List[Dict[str, Any]], dry_run: bool = True, *, system: Optional
 LLAMA_CPP_IMAGE = "ghcr.io/ggml-org/llama.cpp"
 LLAMA_CPP_IMAGE_BUILD = "b10818"
 LLAMA_CPP_IMAGE_VARIANT = {"vulkan": "server-vulkan", "cuda": "server-cuda", "cpu": "server"}
-GATEWAY_IMAGE = "ghcr.io/lottage/lodestone:latest"          # built from the gateway Dockerfile (StoneSage/docker/)
-STONESAGE_IMAGE = "ghcr.io/lottage/hearth:latest"           # StoneSage + the Hearth app; ghcr.io/lottage/stonesage = without
+# The release this copy of the installer belongs to. The public-repo builder stamps it (`build_public_repos.py --tag`): it is
+# the git tag of all three repositories, and the compose file names images by it (never `latest`) and builds from it. The
+# source tree carries the number of the next release; a tree built without --tag carries the placeholder, which a release
+# refuses (release_public_repos.py). Image versions drop the leading v: tag v0.1.0-rc.2 = image 0.1.0-rc.2.
+RELEASE_TAG = "v0.1.0-rc.2"
+UNSET_TAG = "UNSET-TAG"
+GITHUB_ORG = "https://github.com/lottage"
+IMAGE_REGISTRY = "ghcr.io/lottage"
+IMAGE_REPOS = ("lodestone", "stonesage", "hearth")        # the three layers; each repository's Dockerfile builds its image
 GPU_KINDS = ("vulkan", "cuda", "cpu")
 MODELS_MOUNT = "/models"
 GATEWAY_CONTAINER_PORT = 8000
@@ -861,6 +1147,33 @@ ENGINE_ROLE_ENV = {"coordinator": "COORDINATOR_URL", "worker": "WORKER_URL", "em
 
 def engine_image(kind: str) -> str:
     return "%s:%s-%s" % (LLAMA_CPP_IMAGE, LLAMA_CPP_IMAGE_VARIANT[kind], LLAMA_CPP_IMAGE_BUILD)
+
+
+def image_version(tag: Optional[str] = None) -> str:
+    tag = tag or RELEASE_TAG
+    return tag[1:] if tag.startswith("v") else tag
+
+
+def layer_image(repo: str, tag: Optional[str] = None) -> str:
+    """ghcr.io/lottage/<repo>:<version> (the image the layer's Dockerfile builds): lodestone = the gateway and model
+    downloader, stonesage = the platform, hearth = StoneSage + the Hearth app (what the cockpit service runs)."""
+    return "%s/%s:%s" % (IMAGE_REGISTRY, repo, image_version(tag))
+
+
+def build_context(repo: str, tag: Optional[str] = None) -> str:
+    """A git URL docker compose builds from without any clone: the repository at the release tag."""
+    return "%s/%s.git#%s" % (GITHUB_ORG, repo, tag or RELEASE_TAG)
+
+
+def lodestone_pip(tag: Optional[str] = None) -> str:
+    return "lodestone @ git+%s/lodestone@%s" % (GITHUB_ORG, tag or RELEASE_TAG)
+
+
+def default_build(tag: Optional[str] = None) -> bool:
+    """Build the images locally unless this version has published ones. Images are published with a final release (v0.1.0),
+    never for a pre-release (v0.1.0-rc.2) or an unstamped tree; --build / --no-build overrides."""
+    tag = tag or RELEASE_TAG
+    return tag == UNSET_TAG or "-" in tag
 
 
 def _gpu_row(index: int, name: str, vendor: str, vram_mb: Optional[int], source: str) -> Dict[str, Any]:
@@ -903,29 +1216,39 @@ def choose_docker_gpu(d: Dict[str, Any], requested: str = "auto") -> Tuple[str, 
 
 
 def docker_stack(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """The plan for a Compose stack: {"profile", "gpu" (kind), "roles", "notes", "threads", "stonesage"}. Reuses PROFILES,
-    place_roles and engine_argv; a GPU request that finds no GPU big enough (or none at all) becomes the CPU profile,
-    unless --profile names a GPU profile on purpose (then one card of that tier is assumed, as the native installer does)."""
+    """The plan for a Compose stack: {"profile", "gpu" (kind), "roles", "notes", "threads", "stonesage", "build", "tag"}. Reuses
+    PROFILES, place_roles and engine_argv; a GPU request that finds no GPU big enough (or none at all) becomes the CPU profile,
+    unless --profile names a GPU profile on purpose (then one card of that tier is assumed, as the native installer does).
+    build: write `build:` sections (images made from the GitHub tag) instead of expecting published images; None = per the tag."""
     c = choices or {}
     requested_kind = c.get("gpu") or "auto"
     requested_profile = c.get("profile") or "auto"
     kind, notes = choose_docker_gpu(d, requested_kind)
-    if requested_profile not in ("auto",) + tuple(PROFILES):
-        raise InstallerError("unknown profile %r (choose from auto, %s)" % (requested_profile, ", ".join(PROFILES)))
+    if requested_profile != "auto":
+        requested_profile = canonical_profile(requested_profile)
     if kind == "cpu" and requested_profile not in ("auto", "cpu"):
         raise InstallerError("profile %s needs a GPU and --gpu is cpu (or no GPU Docker can use was found): use --profile cpu, "
                              "or --gpu vulkan / --gpu cuda" % requested_profile)
-    view = dict(d, gpus=docker_gpus(d, kind))
-    if kind != "cpu" and not view["gpus"] and requested_profile in PROFILES and requested_profile != "cpu":
-        view["gpus"] = [_gpu_row(0, "GPU 0 (assumed)", "nvidia" if kind == "cuda" else UNKNOWN, None, UNKNOWN)]
-    profile = "cpu" if kind == "cpu" else choose_profile(view, requested_profile)
+    gpus = docker_gpus(d, kind)
+    if kind != "cpu" and not gpus and requested_profile in PROFILES and requested_profile != "cpu":
+        gpus = [_gpu_row(0, "GPU 0 (assumed)", "nvidia" if kind == "cuda" else UNKNOWN, None, UNKNOWN)]
+    view = dict(d, gpus=gpus, cards=[dict(g, source=g.get("vram_source") if g.get("vram_mb") else "vulkan", vulkan=True)
+                                     for g in gpus])
+    if kind == "cpu":
+        profile, why = "cpu", []
+    else:
+        profile, why = explain_profile(view["cards"], requested_profile)
     if profile == "cpu" and kind != "cpu":
-        notes.append("no %s GPU with enough memory was found: running on the CPU (pass --profile gpu-small or gpu-large to "
-                     "assume a GPU you know is there)" % kind)
+        notes += why or ["no %s GPU with enough memory was found: running on the CPU (pass --profile gpu-8gb, or the rung that "
+                         "matches your card, to assume a GPU you know is there)" % kind]
         kind = "cpu"
+    else:
+        notes += why
     roles, role_notes = place_roles(profile, view, bool(c.get("vision")))
+    build = c.get("build")
+    tag = c.get("tag") or RELEASE_TAG
     return {"profile": profile, "gpu": kind, "roles": roles, "notes": notes + role_notes, "threads": cpu_threads(d),
-            "stonesage": c.get("stonesage", True)}
+            "stonesage": c.get("stonesage", True), "tag": tag, "build": default_build(tag) if build is None else bool(build)}
 
 
 def _py_http_check(port: int, path: str) -> List[str]:
@@ -944,8 +1267,12 @@ def compose_services(stack: Dict[str, Any]) -> Dict[str, Any]:
                 fetch.append("python -m lodestone.model_downloader --repo %s --file %s --dest %s"
                              % (shlex.quote(f["repo"]), shlex.quote(f["file"]), MODELS_MOUNT))
     verify = 'cd %s && ( [ "$$LODESTONE_VERIFY_MODELS" != 1 ] || sha256sum -c SHA256SUMS )' % MODELS_MOUNT
+    tag, build = stack.get("tag") or RELEASE_TAG, bool(stack.get("build"))
+    # build: the images are made from the repositories at the release tag (a git URL: no clone needed). `models` and `gateway`
+    # run the same image, so both carry the identical section (one build, the second is cached).
+    gateway_build = {"build": {"context": build_context("lodestone", tag)}} if build else {}
     svc["models"] = {
-        "image": "${LODESTONE_IMAGE:-%s}" % GATEWAY_IMAGE, "restart": "no",
+        "image": "${LODESTONE_IMAGE:-%s}" % layer_image("lodestone", tag), **gateway_build, "restart": "no",
         "command": ["sh", "-c", " && ".join(fetch + [verify])],
         "environment": {"LODESTONE_VERIFY_MODELS": "${LODESTONE_VERIFY_MODELS:-0}"},
         "volumes": ["models:%s" % MODELS_MOUNT]}
@@ -969,7 +1296,7 @@ def compose_services(stack: Dict[str, Any]) -> Dict[str, Any]:
     cpu_brain = {"COORDINATOR_CPU": "1"} if coordinator_on_cpu(roles) else {}     # longer waits for its answers
     healthy = {r["name"]: {"condition": "service_healthy"} for r in roles}
     svc["gateway"] = {
-        "image": "${LODESTONE_IMAGE:-%s}" % GATEWAY_IMAGE, "restart": "unless-stopped",
+        "image": "${LODESTONE_IMAGE:-%s}" % layer_image("lodestone", tag), **gateway_build, "restart": "unless-stopped",
         "command": ["python", "-m", "lodestone.gateway", "--host", "0.0.0.0", "--port", str(GATEWAY_CONTAINER_PORT)],
         "environment": dict(urls, LODESTONE_API_KEY="${LODESTONE_API_KEY:?set LODESTONE_API_KEY in .env}", **cpu_brain),
         "ports": ["${LODESTONE_BIND:-127.0.0.1}:${GATEWAY_PORT:-%d}:%d" % (GATEWAY_CONTAINER_PORT, GATEWAY_CONTAINER_PORT)],
@@ -977,8 +1304,19 @@ def compose_services(stack: Dict[str, Any]) -> Dict[str, Any]:
                         "retries": 5, "start_period": "20s"},
         "depends_on": healthy}
     if stack["stonesage"]:
+        hearth_build: Dict[str, Any] = {}
+        if build:
+            # Hearth's Dockerfile is FROM the StoneSage image, which exists nowhere yet: `stonesage-image` builds it (a one-shot
+            # that only has to exist) and the Hearth build takes it as a named context (`service:`), which also makes Compose
+            # build it first. Build order is therefore lodestone, stonesage, hearth, from `docker compose up -d --build` alone.
+            svc["stonesage-image"] = {
+                "image": layer_image("stonesage", tag),
+                "build": {"context": build_context("stonesage", tag), "args": {"LODESTONE_PIP": lodestone_pip(tag)}},
+                "entrypoint": ["true"], "restart": "no"}
+            hearth_build = {"build": {"context": build_context("hearth", tag), "args": {"STONESAGE_IMAGE": "stonesage-image"},
+                                      "additional_contexts": {"stonesage-image": "service:stonesage-image"}}}
         svc["stonesage"] = {
-            "image": "${STONESAGE_IMAGE:-%s}" % STONESAGE_IMAGE, "restart": "unless-stopped",
+            "image": "${STONESAGE_IMAGE:-%s}" % layer_image("hearth", tag), **hearth_build, "restart": "unless-stopped",
             "environment": dict(urls, STONESAGE_APPS="hearth", HASS_URL="${HASS_URL:-http://homeassistant.local:8123}",
                                 HASS_TOKEN="${HASS_TOKEN:-}", TZ="${TZ:-UTC}",
                                 # the cockpit never runs open: compose stops here when .env has no key
@@ -989,7 +1327,8 @@ def compose_services(stack: Dict[str, Any]) -> Dict[str, Any]:
             # /api/health is the one public route (ok + version, nothing else), so the check needs no key
             "healthcheck": {"test": _py_http_check(STONESAGE_CONTAINER_PORT, "/api/health"), "interval": "30s",
                             "timeout": "5s", "retries": 5, "start_period": "60s"},
-            "depends_on": {n: v for n, v in healthy.items() if n in ("coordinator", "embedder")}}
+            "depends_on": dict({n: v for n, v in healthy.items() if n in ("coordinator", "embedder")},
+                               **({"stonesage-image": {"condition": "service_completed_successfully"}} if build else {}))}
     return svc
 
 
@@ -1042,6 +1381,7 @@ def render_compose(stack: Dict[str, Any]) -> str:
     kind = stack["gpu"]
     why = {
         "models": "one-shot: downloads the models into the shared volume (resumable; SHA-256 in SHA256SUMS), then exits",
+        "stonesage-image": "one-shot, build only: makes the StoneSage image that the Hearth image below is built FROM, then exits",
         "gateway": "the one address to use: an OpenAI-compatible API in front of the engines (http://localhost:8000/v1)",
         "stonesage": "StoneSage with the Hearth app: the cockpit on http://localhost:8888; fill HASS_TOKEN in .env first",
     }
@@ -1053,6 +1393,8 @@ def render_compose(stack: Dict[str, Any]) -> str:
             stack["profile"], {"vulkan": "AMD/Intel GPUs through /dev/dri (Linux)", "cuda": "NVIDIA GPUs (nvidia-container-toolkit)",
                                "cpu": "CPU only"}[kind]),
         "# Engines use llama.cpp's published images (%s); the tag is LLAMA_CPP_IMAGE in .env." % engine_image(kind),
+        ("# Start:  docker compose up -d --build     The images are built from GitHub (%s), then the models are downloaded "
+         "(several GB): docker compose logs -f models" % stack["tag"]) if stack.get("build") else
         "# Start:  docker compose up -d     Models are downloaded on the first start (several GB): docker compose logs -f models",
         "# Secrets: none in this file; the API key and the Home Assistant token go in .env.",
     ]
@@ -1073,10 +1415,14 @@ def render_env(stack: Dict[str, Any], keys: Optional[Dict[str, str]] = None) -> 
         "",
         "# llama.cpp image for the engines (see the note on LLAMA_CPP_IMAGE_BUILD in lodestone/installer.py before changing it)",
         "LLAMA_CPP_IMAGE=%s" % engine_image(kind),
-        "LODESTONE_IMAGE=%s" % GATEWAY_IMAGE,
+        "# The Lodestone and Hearth images (release %s): %s." % (
+            stack.get("tag") or RELEASE_TAG,
+            "built from GitHub by `docker compose up -d --build`, named by version, never latest" if stack.get("build")
+            else "pulled by version, never latest"),
+        "LODESTONE_IMAGE=%s" % layer_image("lodestone", stack.get("tag")),
     ]
     if stack["stonesage"]:
-        lines.append("STONESAGE_IMAGE=%s" % STONESAGE_IMAGE)
+        lines.append("STONESAGE_IMAGE=%s" % layer_image("hearth", stack.get("tag")))
     lines += [
         "",
         "# The gateway. Bound to this computer only; set LODESTONE_BIND=0.0.0.0 to offer it on your network AND set a key first.",
@@ -1153,17 +1499,17 @@ def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], ou
     d = detected if detected is not None else detect(None, DEFAULT_PREFIX, "")
     keys = api_keys(args.out)
     files, stack = docker_files(d, {"profile": args.profile, "gpu": args.gpu, "vision": args.vision,
-                                    "stonesage": not args.no_stonesage, "keys": keys})
+                                    "stonesage": not args.no_stonesage, "keys": keys, "build": args.build})
     for line in describe(d):
         out(line)
-    out("docker:    profile %s, %s images" % (stack["profile"], stack["gpu"]))
+    out("docker:    profile %s, %s engine images, release %s (%s)" % (
+        stack["profile"], stack["gpu"], stack["tag"], "built from GitHub on first start" if stack["build"] else "pulled from ghcr.io"))
     for r in stack["roles"]:
         out("  %-12s %s on %s" % (r["name"], r["files"][0]["file"], "CPU" if r["gpu"] is None else "GPU %d" % r["gpu"]))
     for n in stack["notes"]:
         out("  note: " + n)
-    if coordinator_on_cpu(stack["roles"]):
-        for line in CPU_EXPECTATION:
-            out(line)
+    for line in expectation_lines(stack["roles"]):
+        out(line)
     if args.json:
         out(json.dumps(compose_dict(stack), indent=2))
         return 0
@@ -1172,8 +1518,9 @@ def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], ou
     out("API keys: generated and written to %s (owner-only). %s" % (env_path, (
         "The cockpit's login asks for STONESAGE_API_KEY; the gateway wants LODESTONE_API_KEY as a bearer."
         if stack["stonesage"] else "The gateway wants LODESTONE_API_KEY as a bearer.")))
-    out("Next: %sthen run `docker compose up -d` in %s." % (
-        "fill HASS_TOKEN in .env, " if stack["stonesage"] else "", args.out))
+    out("Next: %srun `cd %s && docker compose up -d%s`" % (
+        "fill HASS_TOKEN in .env, then " if stack["stonesage"] else "", shlex.quote(os.path.abspath(args.out)),
+        " --build" if stack["build"] else ""))
     return 0
 
 
@@ -1182,7 +1529,9 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
          out: Callable[[str], None] = print) -> int:
     ap = argparse.ArgumentParser(prog="python -m lodestone.installer", description=__doc__.split("\n\n")[0])
     ap.add_argument("--apply", action="store_true", help="really install (Linux, root); without it the plan is only printed")
-    ap.add_argument("--profile", default="auto", choices=["auto"] + list(PROFILES), help="default: from the largest GPU's VRAM")
+    ap.add_argument("--profile", default="auto", choices=profile_choices(),
+                    help="auto (default): the rung of the GPU ladder the largest GPU's VRAM reaches; or force a rung (--list-profiles)")
+    ap.add_argument("--list-profiles", action="store_true", help="print the GPU ladder (rungs, cards, models, speed) and exit")
     ap.add_argument("--prefix", default=DEFAULT_PREFIX, help="install directory (default %s)" % DEFAULT_PREFIX)
     ap.add_argument("--config", help="config file to merge endpoint keys into (default PREFIX/config.json)")
     ap.add_argument("--vision", action="store_true", help="also install the vision engine (needs a GPU with ~6.5 GB to spare)")
@@ -1192,7 +1541,16 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
                     help="with --docker: vulkan (AMD/Intel, Linux), cuda (NVIDIA), cpu; default: from what is found, else cpu")
     ap.add_argument("--out", default=".", help="with --docker: directory for docker-compose.yml and .env (default: here)")
     ap.add_argument("--no-stonesage", action="store_true", help="with --docker: engines, models and gateway only")
+    ap.add_argument("--build", action=argparse.BooleanOptionalAction, default=None,
+                    help="with --docker: write build sections (images made from GitHub at the release tag, no clone) instead of "
+                         "pulling published images; default: on for a pre-release or unstamped tree, off for a final release")
     args = ap.parse_args(argv)
+    if args.list_profiles:
+        if args.json:
+            out(json.dumps(ladder_rows(), indent=2))
+        else:
+            format_ladder(out)
+        return 0
     if args.docker and args.apply:
         print("installer: --docker writes files for `docker compose up`; --apply is the bare-metal install", file=sys.stderr)
         return 2
@@ -1212,14 +1570,16 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
             return 0
         for line in describe(d):
             out(line)
-        roles, _ = place_roles(choose_profile(d, args.profile), d, args.vision)
-        out("profile:   %s" % choose_profile(d, args.profile))
+        profile, notes = explain_profile(cards_of(d), args.profile)
+        roles, role_notes = place_roles(profile, d, args.vision)
+        for n in notes + role_notes:
+            out("  note: " + n)
+        out("profile:   %s" % profile)
         for r in roles:
             out("  %-12s %s on %s, port %d" % (r["name"], r["files"][0]["file"],
                                                "CPU" if r["gpu"] is None else "GPU %d" % r["gpu"], r["port"]))
-        if coordinator_on_cpu(roles):
-            for line in CPU_EXPECTATION:
-                out(line)
+        for line in expectation_lines(roles):
+            out(line)
         out("DRY RUN: nothing is changed. Re-run with --apply (as root, on Linux) to install." if not args.apply else "APPLYING:")
         apply(steps, dry_run=not args.apply, out=out)
     except InstallerError as e:

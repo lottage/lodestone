@@ -86,6 +86,12 @@ def _normalise(name: str, value: str) -> str:
     return f"{scheme}://{value.rstrip('/')}" + ("" if has_port or not port else f":{port}")
 
 
+def configured(name: str, cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """Does config.json or the environment say where the service is? False = it would only be on its default (localhost
+    or nothing). A fresh install uses this to show a service as "not set up" instead of probing a guess."""
+    return bool(_configured(name, _cfg(cfg)))
+
+
 def url(name: str, cfg: Optional[Dict[str, Any]] = None) -> str:
     """The service's base URL ('' when it is optional and not configured). cfg: config.json; None = read it."""
     return _normalise(name, _configured(name, _cfg(cfg)) or SERVICES[name][2])

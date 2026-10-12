@@ -60,7 +60,7 @@ def machine(kind, **over):
         return inst.detect(sources(vulkaninfo(RX6750, RX6600, LLVMPIPE), DRM_AMD2, **over))
     if kind == "amd12":
         return inst.detect(sources(vulkaninfo(RX6750), DRM_AMD2[:1], **over))
-    if kind == "amd11_5":      # just inside gpu-large: coordinator and worker fit, the embedder does not
+    if kind == "amd11_5":      # just inside gpu-12gb: the coordinator fits, the worker does not
         return inst.detect(sources(vulkaninfo(RX6750), [dict(DRM_AMD2[0], vram_mb=11500)], **over))
     if kind == "amd8":
         return inst.detect(sources(vulkaninfo(gpu_block(0, 0x1002, 0x73FF, "DISCRETE_GPU", "AMD Radeon RX 6600")),
@@ -202,54 +202,55 @@ class ParserTests(unittest.TestCase):
 
 class ProfileTests(unittest.TestCase):
     def test_auto_picks_by_the_largest_discrete_gpu(self):
-        self.assertEqual(inst.choose_profile(machine("amd2")), "gpu-large")
-        self.assertEqual(inst.choose_profile(machine("amd12")), "gpu-large")      # 12 GB cards report a little under 12 GiB
-        self.assertEqual(inst.choose_profile(machine("nvidia")), "gpu-large")
-        self.assertEqual(inst.choose_profile(machine("amd8")), "gpu-small")
+        self.assertEqual(inst.choose_profile(machine("amd2")), "gpu-12gb")
+        self.assertEqual(inst.choose_profile(machine("amd12")), "gpu-12gb")      # 12 GB cards report a little under 12 GiB
+        self.assertEqual(inst.choose_profile(machine("nvidia")), "gpu-12gb")
+        self.assertEqual(inst.choose_profile(machine("amd8")), "gpu-8gb")
         self.assertEqual(inst.choose_profile(machine("none")), "cpu")
 
     def test_small_unknown_and_integrated_gpus_mean_cpu(self):
-        four = inst.detect(sources(vulkaninfo(gpu_block(0, 0x1002, 0x1, "DISCRETE_GPU", "Small")),
-                                   [{"vendor_id": 0x1002, "device_id": 0x1, "vram_mb": 4096}]))
-        self.assertEqual(inst.choose_profile(four), "cpu")
+        one = inst.detect(sources(vulkaninfo(gpu_block(0, 0x1002, 0x1, "DISCRETE_GPU", "Small")),
+                                  [{"vendor_id": 0x1002, "device_id": 0x1, "vram_mb": 1024}]))
+        self.assertEqual(inst.choose_profile(one), "cpu")
         self.assertEqual(inst.choose_profile(machine("igpu")), "cpu")
         unknown_vram = inst.detect(sources(vulkaninfo(gpu_block(0, 0x1002, 0x1, "DISCRETE_GPU", "Mystery"))))
         self.assertEqual(inst.choose_profile(unknown_vram), "cpu")
 
     def test_explicit_profile_wins_and_a_bad_one_is_refused(self):
-        self.assertEqual(inst.choose_profile(machine("none"), "gpu-small"), "gpu-small")
+        self.assertEqual(inst.choose_profile(machine("none"), "gpu-8gb"), "gpu-8gb")
         with self.assertRaises(inst.InstallerError):
             inst.choose_profile(machine("none"), "huge")
 
     def test_two_gpus_layout(self):
-        roles, notes = inst.place_roles("gpu-large", machine("amd2"))
+        roles, notes = inst.place_roles("gpu-12gb", machine("amd2"))
         # the coordinator keeps its card to itself; the smaller jobs go where the most room is left
         self.assertEqual({r["name"]: r["gpu"] for r in roles}, {"coordinator": 0, "worker": 1, "embedder": 1})
         self.assertEqual(notes, [])
 
-    def test_one_12gb_gpu_holds_all_three(self):
-        roles, notes = inst.place_roles("gpu-large", machine("amd12"))
-        self.assertEqual({r["name"]: r["gpu"] for r in roles}, {"coordinator": 0, "worker": 0, "embedder": 0})
-        self.assertEqual(notes, [])
-
-    def test_when_the_embedder_does_not_fit_it_runs_on_the_cpu(self):
-        d = machine("amd11_5")
-        self.assertEqual(inst.choose_profile(d), "gpu-large")
-        roles, notes = inst.place_roles("gpu-large", d)
+    def test_one_12gb_gpu_holds_the_coordinator_with_its_draft_and_the_worker_and_the_embedder_goes_to_the_cpu(self):
+        # 9.0 GB (14B + draft) + 2.35 GB (worker) leaves 0.3 GB of the 11.7 GB the margin allows: the 0.6 GB embedder cannot join
+        roles, notes = inst.place_roles("gpu-12gb", machine("amd12"))
         self.assertEqual({r["name"]: r["gpu"] for r in roles}, {"coordinator": 0, "worker": 0, "embedder": None})
         self.assertTrue(any("embedder runs on the CPU" in n for n in notes))
-        steps = inst.plan(d, {})
+        steps = inst.plan(machine("amd12"), {})
         self.assertEqual(flag(unit_args(units_of(steps)["lodestone-embedder.service"]), "--device"), "none")
+
+    def test_just_inside_gpu_12gb_the_worker_is_left_out_and_the_embedder_stays_on_the_card(self):
+        d = machine("amd11_5")
+        self.assertEqual(inst.choose_profile(d), "gpu-12gb")
+        roles, notes = inst.place_roles("gpu-12gb", d)
+        self.assertEqual({r["name"]: r["gpu"] for r in roles}, {"coordinator": 0, "embedder": 0})
+        self.assertTrue(any("worker left out" in n for n in notes))
 
     def test_when_the_worker_does_not_fit_it_is_left_out(self):
         d = inst.detect(sources(vulkaninfo(RX6750), [dict(DRM_AMD2[0], vram_mb=11500)]))
         d["gpus"][0]["vram_mb"] = 9500
-        roles, notes = inst.place_roles("gpu-large", d)
+        roles, notes = inst.place_roles("gpu-12gb", d)
         self.assertEqual([r["name"] for r in roles], ["coordinator", "embedder"])
         self.assertTrue(any("worker left out" in n for n in notes))
 
     def test_gpu_small_has_no_worker(self):
-        roles, _ = inst.place_roles("gpu-small", machine("amd8"))
+        roles, _ = inst.place_roles("gpu-8gb", machine("amd8"))
         self.assertEqual([r["name"] for r in roles], ["coordinator", "embedder"])
         self.assertEqual(roles[0]["files"][0]["file"], "Qwen3-8B-Q4_K_M.gguf")
 
@@ -259,11 +260,11 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(roles[0]["files"][0]["file"], "granite-4.0-h-tiny-Q4_K_M.gguf")
 
     def test_vision_needs_a_gpu_of_its_own(self):
-        roles, notes = inst.place_roles("gpu-large", machine("amd2"), vision=True)
+        roles, notes = inst.place_roles("gpu-12gb", machine("amd2"), vision=True)
         by = {r["name"]: r["gpu"] for r in roles}
         self.assertEqual((by["coordinator"], by["vision"]), (0, 1))
         self.assertEqual(len([f for r in roles if r["name"] == "vision" for f in r["files"]]), 2)   # model + mmproj
-        roles, notes = inst.place_roles("gpu-large", machine("amd12"), vision=True)
+        roles, notes = inst.place_roles("gpu-12gb", machine("amd12"), vision=True)
         self.assertNotIn("vision", [r["name"] for r in roles])
         self.assertTrue(any("vision left out" in n for n in notes))
         roles, notes = inst.place_roles("cpu", machine("none"), vision=True)
@@ -271,15 +272,15 @@ class ProfileTests(unittest.TestCase):
 
     def test_a_forced_profile_that_cannot_fit_is_refused_with_advice(self):
         with self.assertRaises(inst.InstallerError) as cm:
-            inst.place_roles("gpu-large", machine("amd8"))
-        self.assertIn("--profile gpu-small", str(cm.exception))
+            inst.place_roles("gpu-12gb", machine("amd8"))
+        self.assertIn("--profile gpu-8gb", str(cm.exception))
         with self.assertRaises(inst.InstallerError) as cm:
-            inst.place_roles("gpu-large", machine("none"))
+            inst.place_roles("gpu-12gb", machine("none"))
         self.assertIn("--profile cpu", str(cm.exception))
 
     def test_forced_profile_on_a_card_of_unknown_size_trusts_the_person(self):
         d = inst.detect(sources(vulkaninfo(gpu_block(0, 0x1002, 0x1, "DISCRETE_GPU", "Mystery"))))
-        roles, _ = inst.place_roles("gpu-small", d)
+        roles, _ = inst.place_roles("gpu-8gb", d)
         self.assertEqual(roles[0]["gpu"], 0)
 
     def test_every_model_in_the_table_is_complete(self):
@@ -297,8 +298,8 @@ class ProfileTests(unittest.TestCase):
 class UnitRuleTests(unittest.TestCase):
     """The rules in the module docstring, asserted on every unit of every profile."""
 
-    PLANS = [("amd2", "gpu-large", False), ("amd2", "gpu-large", True), ("amd12", "gpu-large", False),
-             ("amd8", "gpu-small", False), ("nvidia", "auto", False), ("none", "cpu", False), ("amd2", "cpu", False)]
+    PLANS = [("amd2", "gpu-12gb", False), ("amd2", "gpu-12gb", True), ("amd12", "gpu-12gb", False),
+             ("amd8", "gpu-8gb", False), ("nvidia", "auto", False), ("none", "cpu", False), ("amd2", "cpu", False)]
 
     def each_unit(self):
         for kind, profile, vision in self.PLANS:
@@ -307,7 +308,7 @@ class UnitRuleTests(unittest.TestCase):
                 yield kind, profile, name, text, unit_args(text) if name != "lodestone-gateway.service" else None
 
     def test_there_is_a_unit_per_role_and_one_for_the_gateway(self):
-        steps = inst.plan(machine("amd2"), {"profile": "gpu-large", "vision": True})
+        steps = inst.plan(machine("amd2"), {"profile": "gpu-12gb", "vision": True})
         self.assertEqual(sorted(units_of(steps)), ["lodestone-coordinator.service", "lodestone-embedder.service",
                                                    "lodestone-gateway.service", "lodestone-vision.service",
                                                    "lodestone-worker.service"])
@@ -362,7 +363,7 @@ class UnitRuleTests(unittest.TestCase):
                 self.assertIn("-t", args)
 
     def test_pin_matches_the_planned_gpu_and_the_wait_counts_all_gpus(self):
-        steps = inst.plan(machine("amd2"), {"profile": "gpu-large"})
+        steps = inst.plan(machine("amd2"), {"profile": "gpu-12gb"})
         u = units_of(steps)
         self.assertIn('GGML_VK_VISIBLE_DEVICES=0"', u["lodestone-coordinator.service"])
         self.assertIn('GGML_VK_VISIBLE_DEVICES=1"', u["lodestone-embedder.service"])
@@ -454,7 +455,7 @@ class PlanTests(unittest.TestCase):
 
     def test_models_go_through_the_downloader_with_a_size_skip(self):
         steps = [s for s in inst.plan(machine("amd2"), {}) if s["id"].startswith("model-")]
-        self.assertEqual(len(steps), 3)
+        self.assertEqual(len(steps), 4)          # the 14B, its 0.6B draft, the worker, the embedder
         for s in steps:
             argv = s["commands"][0]
             self.assertEqual(argv[:3], ["python3", "-m", "lodestone.model_downloader"])
@@ -467,8 +468,8 @@ class PlanTests(unittest.TestCase):
 
     def test_vision_downloads_both_files_once(self):
         steps = [s for s in inst.plan(machine("amd2"), {"vision": True}) if s["id"].startswith("model-")]
-        self.assertEqual(len(steps), 5)
-        self.assertEqual(len({s["id"] for s in steps}), 5)
+        self.assertEqual(len(steps), 6)
+        self.assertEqual(len({s["id"] for s in steps}), 6)
 
     def test_service_user_and_gpu_groups(self):
         s = next(x for x in inst.plan(machine("amd2"), {}) if x["id"] == "service-user")
@@ -483,7 +484,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(cfg["cluster"], {"coordinator_url": "http://127.0.0.1:8001/v1", "embedder_url": "http://127.0.0.1:8003/v1"})
         self.assertEqual(cfg["gateway"], {"host": "127.0.0.1", "port": 8000})
         self.assertNotIn("api_key", cfg["gateway"])
-        self.assertEqual(cfg["lodestone"]["install"]["profile"], "gpu-small")
+        self.assertEqual(cfg["lodestone"]["install"]["profile"], "gpu-8gb")
         self.assertTrue(step["secret"])
         self.assertEqual(step["modes"], {"/opt/lodestone/config.json": 0o640})
 
@@ -634,7 +635,7 @@ class DryRunAndApplyTests(unittest.TestCase):
         self.assertEqual(inst.main([], detected=machine("amd2"), out=lines.append), 0)
         text = "\n".join(lines)
         self.assertIn("DRY RUN", text)
-        self.assertIn("profile:   gpu-large", text)
+        self.assertIn("profile:   gpu-12gb", text)
         self.assertIn("coordinator", text)
 
     def test_cpu_profile_says_what_to_expect(self):

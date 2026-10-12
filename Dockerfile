@@ -1,10 +1,10 @@
 # Lodestone gateway image (also runs the one-shot model downloader of the Compose stack). Standard library only: no pip.
 #
 # Shipped as `Dockerfile` in the lodestone repository, whose root holds the lodestone/ package:
-#     docker build -t ghcr.io/lottage/lodestone:latest .
+#     docker build -t lodestone:local .
 # Run by docker-compose.yml (python -m lodestone.installer --docker); alone:
 #     docker run --rm -p 127.0.0.1:8000:8000 -e COORDINATOR_URL=http://host.docker.internal:8001/v1 \
-#         -e LODESTONE_API_KEY=... ghcr.io/lottage/lodestone:latest
+#         -e LODESTONE_API_KEY=... lodestone:local
 # (From the private monorepo the same file builds with the context StoneSage/backend.)
 # Base image: an exact version tag, never a floating one. digest: pin at release (docker buildx imagetools inspect python:3.12.7-slim-bookworm,
 # then FROM python:3.12.7-slim-bookworm@sha256:<digest>); tests/test_docker_files.py checks every FROM has an exact tag.
