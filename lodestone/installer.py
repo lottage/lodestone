@@ -467,19 +467,25 @@ def cards_of(d: Dict[str, Any]) -> List[Dict[str, Any]]:
              "index": g["index"]} for g in d["gpus"]]
 
 
-def describe(d: Dict[str, Any]) -> List[str]:
+def describe(d: Dict[str, Any], native: bool = True) -> List[str]:
+    """The machine report. native=False (the Docker path) leaves out the lines about the bare-metal install (Vulkan
+    packages, a llama-server binary on this host): the Docker engines use their own images."""
     cards = cards_of(d)
     gpu = ["  %s, %s (%s%s)%s" % (c["name"], gb(c["vram_mb"]), c["source"], "" if c["vulkan"] else "; Vulkan does not list it",
                                   " (integrated)" if c["integrated"] else "") for c in cards]
     ls = d["llama_server"]
     vulkan = {"ok": "ok", "no-gpu": "installed, lists no GPU", UNKNOWN: "not installed (vulkaninfo missing)"}[d["vulkan"]]
-    return ["machine:  %s %s, %s, %s" % (d["system"], d["machine"], d["os"]["pretty"],
-                                          ("root" if d["is_root"] else "not root") if d["is_root"] is not None else "root unknown"),
-            "cpu/ram:  %s threads, %s" % (d["cpu_count"] or UNKNOWN, ("%.1f GB" % (d["ram_mb"] / 1024)) if d["ram_mb"] else UNKNOWN),
-            "vulkan:   %s" % vulkan,
-            "gpus:     %s" % (("%d found (name, VRAM, where the size came from)" % len(cards)) if cards else
-                              "none found (looked at nvidia-smi, sysfs and vulkaninfo)")] + gpu + [
-            "llama-server: %s" % (("%s (build %s)" % (ls["path"], ls["build"] or UNKNOWN)) if ls else "not installed")]
+    lines = ["machine:  %s %s, %s, %s" % (d["system"], d["machine"], d["os"]["pretty"],
+                                           ("root" if d["is_root"] else "not root") if d["is_root"] is not None else "root unknown"),
+             "cpu/ram:  %s threads, %s" % (d["cpu_count"] or UNKNOWN, ("%.1f GB" % (d["ram_mb"] / 1024)) if d["ram_mb"] else UNKNOWN)]
+    if native:
+        lines.append("vulkan:   %s" % vulkan)
+    lines.append("gpus:     %s" % (("%d found (name, VRAM, where the size came from)" % len(cards)) if cards else
+                                   "none found (looked at nvidia-smi, sysfs and vulkaninfo)"))
+    lines += gpu
+    if native:
+        lines.append("llama-server: %s" % (("%s (build %s)" % (ls["path"], ls["build"] or UNKNOWN)) if ls else "not installed"))
+    return lines
 
 
 # ---------------------------------------------------------------------------------------------- profile + layout ----
@@ -1132,7 +1138,7 @@ LLAMA_CPP_IMAGE_VARIANT = {"vulkan": "server-vulkan", "cuda": "server-cuda", "cp
 # the git tag of all three repositories, and the compose file names images by it (never `latest`) and builds from it. The
 # source tree carries the number of the next release; a tree built without --tag carries the placeholder, which a release
 # refuses (release_public_repos.py). Image versions drop the leading v: tag v0.1.0-rc.2 = image 0.1.0-rc.2.
-RELEASE_TAG = "v0.1.0-rc.2"
+RELEASE_TAG = "v0.1.0-rc.3"
 UNSET_TAG = "UNSET-TAG"
 GITHUB_ORG = "https://github.com/lottage"
 IMAGE_REGISTRY = "ghcr.io/lottage"
@@ -1269,10 +1275,14 @@ def compose_services(stack: Dict[str, Any]) -> Dict[str, Any]:
     verify = 'cd %s && ( [ "$$LODESTONE_VERIFY_MODELS" != 1 ] || sha256sum -c SHA256SUMS )' % MODELS_MOUNT
     tag, build = stack.get("tag") or RELEASE_TAG, bool(stack.get("build"))
     # build: the images are made from the repositories at the release tag (a git URL: no clone needed). `models` and `gateway`
-    # run the same image, so both carry the identical section (one build, the second is cached).
+    # run the same image, but only `gateway` builds it: two services with a build section for one image name fail in a
+    # parallel build ("image ... already exists"). `models` gets the image name and pull_policy: never, so it uses the
+    # image the gateway build made (compose builds every image before it starts any container, so no depends_on is needed:
+    # a depends_on on the gateway would be a cycle, since the gateway waits for the engines, which wait for models).
     gateway_build = {"build": {"context": build_context("lodestone", tag)}} if build else {}
+    models_image = {"pull_policy": "never"} if build else {}
     svc["models"] = {
-        "image": "${LODESTONE_IMAGE:-%s}" % layer_image("lodestone", tag), **gateway_build, "restart": "no",
+        "image": "${LODESTONE_IMAGE:-%s}" % layer_image("lodestone", tag), **models_image, "restart": "no",
         "command": ["sh", "-c", " && ".join(fetch + [verify])],
         "environment": {"LODESTONE_VERIFY_MODELS": "${LODESTONE_VERIFY_MODELS:-0}"},
         "volumes": ["models:%s" % MODELS_MOUNT]}
@@ -1500,7 +1510,7 @@ def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], ou
     keys = api_keys(args.out)
     files, stack = docker_files(d, {"profile": args.profile, "gpu": args.gpu, "vision": args.vision,
                                     "stonesage": not args.no_stonesage, "keys": keys, "build": args.build})
-    for line in describe(d):
+    for line in describe(d, native=False):
         out(line)
     out("docker:    profile %s, %s engine images, release %s (%s)" % (
         stack["profile"], stack["gpu"], stack["tag"], "built from GitHub on first start" if stack["build"] else "pulled from ghcr.io"))

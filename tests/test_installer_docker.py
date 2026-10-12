@@ -547,9 +547,12 @@ class ReleaseTagTests(unittest.TestCase):
         self.assertTrue(stack["build"])
         svcs = comp["services"]
         ctx = lambda repo: "https://github.com/lottage/%s.git#%s" % (repo, RC)
-        for name in ("models", "gateway"):                      # the same image, the same build
-            self.assertEqual(svcs[name]["build"], {"context": ctx("lodestone")}, name)
+        self.assertEqual(svcs["gateway"]["build"], {"context": ctx("lodestone")})     # the one service that builds lodestone
+        self.assertNotIn("build", svcs["models"])                                      # the same image, built once: no 2nd build
+        for name in ("models", "gateway"):
             self.assertEqual(svcs[name]["image"], "${LODESTONE_IMAGE:-ghcr.io/lottage/lodestone:0.1.0-rc.2}")
+        self.assertEqual(svcs["models"]["pull_policy"], "never")
+        self.assertNotIn("pull_policy", svcs["gateway"])
         base = svcs["stonesage-image"]
         self.assertEqual(base["image"], "ghcr.io/lottage/stonesage:0.1.0-rc.2")
         self.assertEqual(base["build"], {"context": ctx("stonesage"),
@@ -570,6 +573,35 @@ class ReleaseTagTests(unittest.TestCase):
         self.assertEqual(env["LODESTONE_IMAGE"], "ghcr.io/lottage/lodestone:0.1.0-rc.2")
         self.assertEqual(env["STONESAGE_IMAGE"], "ghcr.io/lottage/hearth:0.1.0-rc.2")
         self.assertIn("docker compose up -d --build", files["docker-compose.yml"])
+
+    def test_one_build_per_image_in_every_profile_and_mode(self):
+        """Compose builds the services' images in parallel: two build sections for one image name fail ("already exists").
+        In build mode exactly one service builds each image, and every other service that uses that image never pulls it
+        (it is made locally); without build sections nothing is built or set to never-pull."""
+        for tag in (RC, inst.UNSET_TAG):
+            for mkind, choices, _profile, _kind in CASES:
+                for build in (True, False):
+                    for stonesage in (True, False):
+                        label = (tag, mkind, choices, build, stonesage)
+                        files, stack, comp = self.render_with(tag, mkind, **dict(choices, build=build, stonesage=stonesage))
+                        svcs = comp["services"]
+                        built = {}
+                        for name, body in svcs.items():
+                            if "build" in body:
+                                built.setdefault(body["image"], []).append(name)
+                        for image, names in built.items():
+                            self.assertEqual(len(names), 1, (label, image, names))
+                        for name, body in svcs.items():
+                            if "build" not in body and body.get("image") in built:
+                                self.assertEqual(body.get("pull_policy"), "never", (label, name))
+                        if not build:
+                            self.assertEqual(built, {}, label)
+                            self.assertFalse(any("pull_policy" in b for b in svcs.values()), label)
+                        else:
+                            self.assertEqual(built[svcs["gateway"]["image"]], ["gateway"], label)
+                            if stonesage:
+                                self.assertEqual(built[svcs["stonesage-image"]["image"]], ["stonesage-image"], label)
+                                self.assertEqual(built[svcs["stonesage"]["image"]], ["stonesage"], label)
 
     def test_no_file_ever_says_latest(self):
         for tag in (RC, "v0.1.0", inst.UNSET_TAG):
@@ -632,6 +664,8 @@ class ReleaseTagTests(unittest.TestCase):
         self.assertTrue(any("release %s (built from GitHub on first start)" % RC in l for l in out), out)
         nxt = [l for l in out if l.startswith("Next:")][0]
         self.assertIn("docker compose up -d --build", nxt)
+        self.assertFalse([l for l in out if l.startswith(("vulkan:", "llama-server:"))], out)   # native-only lines
+        self.assertTrue([l for l in out if l.startswith("gpus:")], out)
         self.assertIn(os.path.abspath(tmp), nxt)
         comp = load_yaml(slurp(os.path.join(tmp, "docker-compose.yml")))
         self.assertIn("stonesage-image", comp["services"])
