@@ -241,6 +241,10 @@ class DockerMain(unittest.TestCase):
         self.assertIn("iptables -A", text)                                            # the script is printed
         self.assertIn("Not applied", text)
         self.assertIn("sudo sh", text)
+        # the LAST lines are the ones people follow: the firewall step comes first, then docker compose up
+        tail = text[text.rindex("Next, in this order:"):]
+        self.assertLess(tail.index("1. apply Grove's firewall"), tail.index("docker compose up"))
+        self.assertNotIn("Next: run", text)
         if os.name == "posix":
             self.assertEqual(os.stat(os.path.join(tmp, ".env")).st_mode & 0o777, 0o600)
         env = open(os.path.join(tmp, ".env"), encoding="utf-8").read()
@@ -249,6 +253,8 @@ class DockerMain(unittest.TestCase):
     def test_nothing_is_asked_or_added_when_no_one_is_at_a_terminal(self):
         code, text, tmp = self.run_main("--gpu", "cpu")                              # no flag, no ask callback
         self.assertEqual(code, 0)
+        self.assertIn("Next: run `cd ", text)                                         # no Grove: the one-step form
+        self.assertNotIn("firewall", text.split("Next:")[-1])
         self.assertFalse(os.path.exists(os.path.join(tmp, "grove-firewall.sh")))
         self.assertNotIn("grove", open(os.path.join(tmp, "docker-compose.yml"), encoding="utf-8").read().lower())
 

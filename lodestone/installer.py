@@ -1156,7 +1156,7 @@ LLAMA_CPP_IMAGE_VARIANT = {"vulkan": "server-vulkan", "cuda": "server-cuda", "cp
 # the git tag of all three repositories, and the compose file names images by it (never `latest`) and builds from it. The
 # source tree carries the number of the next release; a tree built without --tag carries the placeholder, which a release
 # refuses (release_public_repos.py). Image versions drop the leading v: tag v0.1.0-rc.2 = image 0.1.0-rc.2.
-RELEASE_TAG = "v0.1.0-rc.6"
+RELEASE_TAG = "v0.1.0-rc.7"
 UNSET_TAG = "UNSET-TAG"
 GITHUB_ORG = "https://github.com/lottage"
 IMAGE_REGISTRY = "ghcr.io/lottage"
@@ -1638,8 +1638,17 @@ def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], ou
         out("Grove: the first resident (%s) is created, unnamed, by the worker on its first start; the scheduler is OFF, so nothing runs "
             "until you start a session from the GROVE tab. Residents are served by %s%s." % (
                 g["resident"], g["engine_url"], " (%s)" % g["model"] if g["model"] else ""))
-        firewall_flow(args, d, args.out, out, ask, run)
-    out("Next: run `cd %s && docker compose up -d%s`" % (shlex.quote(os.path.abspath(args.out)), " --build" if stack["build"] else ""))
+        walled = firewall_flow(args, d, args.out, out, ask, run)
+    up = "cd %s && docker compose up -d%s" % (shlex.quote(os.path.abspath(args.out)), " --build" if stack["build"] else "")
+    if stack["garden"] and not walled:
+        # the last lines are the ones people follow: the wall comes first, and the order is spelled out
+        script = shlex.quote(os.path.abspath(os.path.join(args.out, installer_grove.FIREWALL_SCRIPT)))
+        out("Next, in this order:")
+        out("  1. apply Grove's firewall as root:  sudo sh %s" % script)
+        out("  2. then start the stack:            %s" % up)
+        out("Do not start the stack before step 1: until then the reader's network is open to your LAN.")
+    else:
+        out("Next: run `%s`" % up)
     return 0
 
 
