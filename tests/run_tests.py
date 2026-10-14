@@ -23,6 +23,31 @@ REPO_ROOT = os.path.dirname(TESTS_DIR)
 sys.path.insert(0, REPO_ROOT)  # same import root as `python -m unittest` from the repo root
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 blocked_attempts = []
+# The source tree's own data folder (StoneSage/data): where the server writes when STONESAGE_DATA_DIR is not set. A unit run must leave it
+# exactly as it found it (until 2026-10-13 a test wrote Computer's default soul into it). The runner takes a snapshot before the
+# tests and compares after; tests/test_zz_source_data_guard.py repeats the comparison as the last test of the suite.
+SOURCE_DATA = os.path.join(REPO_ROOT, "StoneSage", "data")
+SOURCE_DATA_BEFORE = None
+
+
+def snapshot_tree(path):
+    """{relative path: (size, mtime_ns)} for every file under `path` ({} when there is no such folder)."""
+    found = {}
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            found[os.path.relpath(full, path).replace(os.sep, "/")] = (st.st_size, st.st_mtime_ns)
+    return found
+
+
+def changes_since(before, path):
+    """The files under `path` that are new, or that changed, since `before` (a snapshot_tree result), sorted."""
+    now = snapshot_tree(path)
+    return sorted(rel for rel, stat in now.items() if before.get(rel) != stat)
 
 
 def _is_local(host) -> bool:
@@ -105,6 +130,8 @@ def main() -> int:
             if default and env not in os.environ:
                 os.environ[env] = default.replace("127.0.0.1", "192.0.2.1").replace("homeassistant.local", "192.0.2.1")
         install_network_guard()
+        global SOURCE_DATA_BEFORE
+        SOURCE_DATA_BEFORE = snapshot_tree(SOURCE_DATA)
         suite = unittest.defaultTestLoader.discover(TESTS_DIR, pattern=pattern, top_level_dir=TESTS_DIR)
     elif mode == "live":
         suite = unittest.defaultTestLoader.discover(os.path.join(TESTS_DIR, "live"), pattern=pattern)
@@ -116,7 +143,11 @@ def main() -> int:
     if blocked_attempts:
         uniq = sorted({f"{a[0]}:{a[1]}" if isinstance(a, tuple) else str(a) for a in blocked_attempts})
         print(f"\nNetwork guard blocked {len(blocked_attempts)} connection attempt(s) to: {', '.join(uniq)}")
-    return 0 if result.wasSuccessful() else 1
+    stray = changes_since(SOURCE_DATA_BEFORE, SOURCE_DATA) if SOURCE_DATA_BEFORE is not None else []
+    if stray:
+        print(f"\nThe run left {len(stray)} file(s) in StoneSage/data, the source tree's own data folder (a test must use a temp dir "
+              f"or the STONESAGE_DATA_DIR the runner sets): {', '.join(stray[:10])}")
+    return 0 if result.wasSuccessful() and not stray else 1
 
 
 if __name__ == "__main__":

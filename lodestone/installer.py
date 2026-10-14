@@ -53,6 +53,8 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import installer_grove
+
 UNKNOWN = "unknown"
 DEFAULT_PREFIX = "/opt/lodestone"
 SERVICE_USER = "lodestone"
@@ -982,7 +984,23 @@ def plan(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) -> List[Di
     updates: Dict[str, Any] = {"cluster": cluster_updates,
                                "gateway": {"host": ENGINE_HOST, "port": GATEWAY_PORT},
                                "lodestone": {"install": {"profile": profile, "prefix": prefix, "llama_cpp_ref": LLAMA_CPP_REF}}}
-    merged, added, kept = merge_config(d.get("config") or {}, updates, overwrite=("lodestone.install",))
+    overwrite = ("lodestone.install",)
+    grove_steps: List[Dict[str, Any]] = []
+    if c.get("garden"):                                   # Grove (--with-garden): the section in config.json, then the steps below
+        coordinator = next(r for r in roles if r["name"] == "coordinator")
+        try:
+            stonesage_base, _h, _p = installer_grove.parse_stonesage(c.get("garden_stonesage_url") or "")
+            g = installer_grove.garden_choice(c, roles, "http://%s:%d/v1" % (ENGINE_HOST, coordinator["port"]),
+                                              "http://127.0.0.1:%d" % installer_grove.WORKER_PORT)
+            keys = c.get("garden_keys") or installer_grove.new_keys(None, installer_grove.KEY_ENV_WORKER)
+            grove_steps = installer_grove.native_steps(g, keys, c.get("tag") or RELEASE_TAG, GITHUB_ORG, c.get("garden_stonesage_url") or "",
+                                                       bool(c.get("apply_firewall")))
+        except installer_grove.GroveError as e:
+            raise InstallerError(str(e))
+        updates["grove"] = installer_grove.grove_config(g, keys)
+        updates["apps"] = installer_grove.apps_with_grove((d.get("config") or {}).get("apps"))
+        overwrite += ("apps",)
+    merged, added, kept = merge_config(d.get("config") or {}, updates, overwrite=overwrite)
     steps.append({"id": "config", "why": "tell the gateway and everything above it where the engines are (%s); existing keys are "
                   "kept, the old file is backed up first" % config_path,
                   "files": {config_path: render_config(merged)}, "modes": {config_path: 0o640}, "secret": True,
@@ -995,7 +1013,7 @@ def plan(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) -> List[Di
                        "echo \"%s did not answer /health in 3 minutes: journalctl -u %s\" >&2; exit 1"
                        % (ENGINE_HOST, r["port"], r["name"], unit_name(r["name"]))] for r in roles] + [
                       ["sh", "-c", "for i in $(seq 1 30); do curl -fsS %s >/dev/null && exit 0; sleep 1; done; exit 1" % gateway_health]]})
-    return steps
+    return steps + grove_steps
 
 
 # ---------------------------------------------------------------------------------------------------------- apply ----
@@ -1138,11 +1156,11 @@ LLAMA_CPP_IMAGE_VARIANT = {"vulkan": "server-vulkan", "cuda": "server-cuda", "cp
 # the git tag of all three repositories, and the compose file names images by it (never `latest`) and builds from it. The
 # source tree carries the number of the next release; a tree built without --tag carries the placeholder, which a release
 # refuses (release_public_repos.py). Image versions drop the leading v: tag v0.1.0-rc.2 = image 0.1.0-rc.2.
-RELEASE_TAG = "v0.1.0-rc.4"
+RELEASE_TAG = "v0.1.0-rc.5"
 UNSET_TAG = "UNSET-TAG"
 GITHUB_ORG = "https://github.com/lottage"
 IMAGE_REGISTRY = "ghcr.io/lottage"
-IMAGE_REPOS = ("lodestone", "stonesage", "hearth")        # the three layers; each repository's Dockerfile builds its image
+IMAGE_REPOS = ("lodestone", "stonesage", "hearth", "grove")   # the layers and the optional add-on; each repository's Dockerfile builds its image
 GPU_KINDS = ("vulkan", "cuda", "cpu")
 MODELS_MOUNT = "/models"
 GATEWAY_CONTAINER_PORT = 8000
@@ -1253,8 +1271,19 @@ def docker_stack(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) ->
     roles, role_notes = place_roles(profile, view, bool(c.get("vision")))
     build = c.get("build")
     tag = c.get("tag") or RELEASE_TAG
+    garden = None
+    if c.get("garden"):
+        if not c.get("stonesage", True):
+            raise InstallerError("--with-garden adds Grove to the StoneSage cockpit: drop --no-stonesage")
+        coordinator = next(r for r in roles if r["name"] == "coordinator")
+        try:
+            garden = installer_grove.garden_choice(c, roles, "http://coordinator:%d/v1" % coordinator["port"],
+                                                   "http://grove-worker:%d" % installer_grove.WORKER_PORT)
+        except installer_grove.GroveError as e:
+            raise InstallerError(str(e))
     return {"profile": profile, "gpu": kind, "roles": roles, "notes": notes + role_notes, "threads": cpu_threads(d),
-            "stonesage": c.get("stonesage", True), "tag": tag, "build": default_build(tag) if build is None else bool(build)}
+            "stonesage": c.get("stonesage", True), "tag": tag, "build": default_build(tag) if build is None else bool(build),
+            "garden": garden}
 
 
 def _py_http_check(port: int, path: str) -> List[str]:
@@ -1339,6 +1368,8 @@ def compose_services(stack: Dict[str, Any]) -> Dict[str, Any]:
                             "timeout": "5s", "retries": 5, "start_period": "60s"},
             "depends_on": dict({n: v for n, v in healthy.items() if n in ("coordinator", "embedder")},
                                **({"stonesage-image": {"condition": "service_completed_successfully"}} if build else {}))}
+        if stack.get("garden"):
+            installer_grove.add_to_compose(svc, stack, layer_image, build_context, urls)
     return svc
 
 
@@ -1346,7 +1377,11 @@ def compose_dict(stack: Dict[str, Any]) -> Dict[str, Any]:
     vols: Dict[str, Any] = {"models": {}}
     if stack["stonesage"]:
         vols.update({"stonesage-config": {}, "stonesage-data": {}})
-    return {"name": "lodestone", "services": compose_services(stack), "volumes": vols}
+    out: Dict[str, Any] = {"name": "lodestone", "services": compose_services(stack), "volumes": vols}
+    if stack.get("garden"):
+        vols["grove-data"] = {}
+        out["networks"] = installer_grove.compose_networks()
+    return out
 
 
 # A small YAML writer for exactly the shapes compose_dict makes (mappings, lists, strings, ints, booleans): every string is
@@ -1393,8 +1428,11 @@ def render_compose(stack: Dict[str, Any]) -> str:
         "models": "one-shot: downloads the models into the shared volume (resumable; SHA-256 in SHA256SUMS), then exits",
         "stonesage-image": "one-shot, build only: makes the StoneSage image that the Hearth image below is built FROM, then exits",
         "gateway": "the one address to use: an OpenAI-compatible API in front of the engines (http://localhost:8000/v1)",
-        "stonesage": "StoneSage with the Hearth app: the cockpit on http://localhost:8888; fill HASS_TOKEN in .env first",
+        "stonesage": "StoneSage with the Hearth app: the cockpit on http://localhost:8888",
     }
+    if stack.get("garden"):
+        why.update(installer_grove.SERVICE_WHY)
+        why["stonesage"] = "StoneSage with the Hearth app and the Grove add-on: the cockpit on http://localhost:8888"
     for r in stack["roles"]:
         where = ("the CPU" if r["gpu"] is None else "GPU %d" % r["gpu"])
         why[r["name"]] = "%s engine (%s) on %s; reachable by the other services only" % (r["name"], r["files"][0]["file"], where)
@@ -1407,11 +1445,14 @@ def render_compose(stack: Dict[str, Any]) -> str:
          "(several GB): docker compose logs -f models" % stack["tag"]) if stack.get("build") else
         "# Start:  docker compose up -d     Models are downloaded on the first start (several GB): docker compose logs -f models",
         "# Secrets: none in this file; the API key and the Home Assistant token go in .env.",
-    ]
+    ] + (["# Grove is on: grove-worker has no route to the internet; grove-fetcher and grove-searxng have one, which grove-firewall.sh "
+          "(next to this file) filters. Read it, then run it as root before `docker compose up`."] if stack.get("garden") else [])
     lines = head + ["name: %s" % _yaml_scalar(comp["name"]), "services:"]
     for name, body in comp["services"].items():
         lines += ["  # " + why[name], "  %s:" % name] + _yaml_lines(body, 2) + [""]
     lines += ["volumes:"] + _yaml_lines(comp["volumes"], 1)
+    if comp.get("networks"):
+        lines += ["", "networks:"] + _yaml_lines(comp["networks"], 1)
     return "\n".join(lines) + "\n"
 
 
@@ -1464,13 +1505,19 @@ def render_env(stack: Dict[str, Any], keys: Optional[Dict[str, str]] = None) -> 
             "VIDEO_GID=44",
             "RENDER_GID=992",
         ]
+    if stack.get("garden"):
+        lines += installer_grove.env_lines(stack, keys)
     return "\n".join(lines) + "\n"
 
 
 def docker_files(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, str], Dict[str, Any]]:
     """({"docker-compose.yml": text, ".env": text}, stack)."""
     stack = docker_stack(d, choices)
-    return {"docker-compose.yml": render_compose(stack), ".env": render_env(stack, (choices or {}).get("keys"))}, stack
+    keys = (choices or {}).get("keys")
+    files = {"docker-compose.yml": render_compose(stack), ".env": render_env(stack, keys)}
+    if stack.get("garden"):
+        files.update(installer_grove.docker_files(stack, keys))
+    return files, stack
 
 
 def write_docker_files(files: Dict[str, str], out_dir: str, stamp: str, out: Callable[[str], None] = print) -> None:
@@ -1487,29 +1534,85 @@ def write_docker_files(files: Dict[str, str], out_dir: str, stamp: str, out: Cal
                 continue
             path += ".new"
             out("  kept your existing .env; new defaults are in %s" % path)
-        out("  %s: %s" % (path, write_file(path, text, 0o600 if name == ".env" else None, stamp)))
+        mode = 0o600 if name == ".env" else (0o755 if name.endswith(".sh") else None)
+        out("  %s: %s" % (path, write_file(path, text, mode, stamp)))
 
 
-def api_keys(out_dir: str) -> Dict[str, str]:
-    """The keys for .env: the ones an existing .env already holds (re-running never changes your keys), else new random ones."""
-    import secrets
+def api_keys(out_dir: str, garden: bool = False) -> Dict[str, str]:
+    """The keys for .env: the ones an existing .env already holds (re-running never changes your keys), else new random ones.
+    With Grove, its four keys too (the cockpit, the worker and the reader must agree on them)."""
+    names = ("STONESAGE_API_KEY", "LODESTONE_API_KEY") + (installer_grove.DOCKER_KEYS if garden else ())
     have: Dict[str, str] = {}
     try:
         with open(os.path.join(out_dir, ".env"), encoding="utf-8-sig") as f:
             for line in f:
                 name, _, val = line.strip().partition("=")
-                if name in ("STONESAGE_API_KEY", "LODESTONE_API_KEY") and val.strip():
+                if name in names and val.strip():
                     have[name] = val.strip()
     except OSError:
         pass
-    return {n: have.get(n) or secrets.token_urlsafe(32) for n in ("STONESAGE_API_KEY", "LODESTONE_API_KEY")}
+    return installer_grove.new_keys(have, names)
 
 
-def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], out: Callable[[str], None]) -> int:
+Ask = Callable[[str, bool], bool]
+
+
+def want_garden(args: argparse.Namespace, ask: Optional[Ask]) -> bool:
+    """--with-garden / --no-garden decide; otherwise a person at a terminal is asked (default no); a script is never asked."""
+    if getattr(args, "with_garden", None) is not None:
+        return bool(args.with_garden)
+    if ask is not None:
+        return bool(ask("Add Grove, the optional add-on where agents write, search the web and keep a research record? "
+                        "It adds a worker, a web reader and SearXNG (about 1 GB of images)", False))
+    return False
+
+
+def garden_choices(args: argparse.Namespace) -> Dict[str, Any]:
+    return {"garden_resident": getattr(args, "garden_resident", None), "garden_engine_url": getattr(args, "garden_engine_url", None),
+            "garden_model": getattr(args, "garden_model", None), "garden_stonesage_url": getattr(args, "garden_stonesage_url", None)}
+
+
+def firewall_flow(args: argparse.Namespace, d: Dict[str, Any], out_dir: str, out: Callable[[str], None], ask: Optional[Ask],
+                  run: Callable[..., int] = _run_cmd, euid: Optional[int] = None) -> bool:
+    """Show grove-firewall.sh and apply it ONLY after an explicit yes (--apply-firewall, or a yes at the prompt) as root. Never
+    silently. Returns True when it was applied."""
+    script = os.path.join(out_dir, installer_grove.FIREWALL_SCRIPT)
+    quoted = shlex.quote(os.path.abspath(script))
+    out("")
+    out("Grove's firewall: %s. It keeps the reader's network (bridge %s) away from your LAN, your router and this host. Read it:" % (
+        script, installer_grove.EGRESS_BRIDGE))
+    with open(script, encoding="utf-8") as f:
+        for line in f.read().splitlines():
+            out("  | " + line)
+    if d.get("system") != "Linux":
+        out("This is not Linux: Docker Desktop runs containers in a VM, where these iptables rules on the host do not apply. The reader "
+            "still refuses private addresses itself, but the network wall is NOT in place. Prefer a Linux host for Grove.")
+        return False
+    yes = True if getattr(args, "apply_firewall", False) else None
+    if yes is None and ask is not None:
+        yes = ask("Apply the firewall now? (needs root; it adds iptables rules for that one bridge only)", False)
+    if not yes:
+        out("Not applied. Run it as root BEFORE `docker compose up` (the reader's network is open to your LAN until you do): sudo sh %s" % quoted)
+        return False
+    euid = euid if euid is not None else (os.geteuid() if hasattr(os, "geteuid") else None)
+    if euid != 0:
+        out("Not applied: it needs root. Run: sudo sh %s" % quoted)
+        return False
+    code = run(["sh", script])
+    out("Firewall applied." if code == 0 else "The firewall script failed (exit %s): do not start the stack until it is fixed." % code)
+    if code == 0:
+        out("It does not survive a reboot: install %s (next to it) to re-apply it before Docker starts." % installer_grove.FIREWALL_UNIT)
+    return code == 0
+
+
+def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], out: Callable[[str], None],
+                ask: Optional[Ask] = None, run: Callable[..., int] = _run_cmd) -> int:
     d = detected if detected is not None else detect(None, DEFAULT_PREFIX, "")
-    keys = api_keys(args.out)
-    files, stack = docker_files(d, {"profile": args.profile, "gpu": args.gpu, "vision": args.vision,
-                                    "stonesage": not args.no_stonesage, "keys": keys, "build": args.build})
+    garden = want_garden(args, ask)
+    keys = api_keys(args.out, garden)
+    files, stack = docker_files(d, dict({"profile": args.profile, "gpu": args.gpu, "vision": args.vision,
+                                         "stonesage": not args.no_stonesage, "keys": keys, "build": args.build, "garden": garden},
+                                        **garden_choices(args)))
     for line in describe(d, native=False):
         out(line)
     out("docker:    profile %s, %s engine images, release %s (%s)" % (
@@ -1528,15 +1631,47 @@ def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], ou
     out("API keys: generated and written to %s (owner-only). %s" % (env_path, (
         "The cockpit's login asks for STONESAGE_API_KEY; the gateway wants LODESTONE_API_KEY as a bearer."
         if stack["stonesage"] else "The gateway wants LODESTONE_API_KEY as a bearer.")))
-    out("Next: %srun `cd %s && docker compose up -d%s`" % (
-        "fill HASS_TOKEN in .env, then " if stack["stonesage"] else "", shlex.quote(os.path.abspath(args.out)),
-        " --build" if stack["build"] else ""))
+    if stack["stonesage"]:
+        out("HASS_TOKEN in .env may stay empty: the setup wizard in the cockpit asks for the Home Assistant URL and token.")
+    if stack["garden"]:
+        g = stack["garden"]
+        out("Grove: the first resident (%s) is created, unnamed, by the worker on its first start; the scheduler is OFF, so nothing runs "
+            "until you start a session from the GROVE tab. Residents are served by %s%s." % (
+                g["resident"], g["engine_url"], " (%s)" % g["model"] if g["model"] else ""))
+        firewall_flow(args, d, args.out, out, ask, run)
+    out("Next: run `cd %s && docker compose up -d%s`" % (shlex.quote(os.path.abspath(args.out)), " --build" if stack["build"] else ""))
     return 0
 
 
+def existing_grove_keys(d: Dict[str, Any], read: Callable[[str], Optional[str]] = _read_text) -> Optional[Dict[str, str]]:
+    """Keys of an earlier Grove install, so re-running never changes them: the env files if readable (root), else the config's
+    grove section. None when there are none (new random ones are made)."""
+    found: Dict[str, str] = {}
+    for path, names in ((installer_grove.NATIVE_ETC + "/worker.env", installer_grove.KEY_ENV_WORKER),
+                        (installer_grove.NATIVE_ETC + "/reader.env", {"FETCHER_KEY": "GROVE_FETCHER_KEY"})):
+        for line in (read(path) or "").splitlines():
+            name, _, val = line.strip().partition("=")
+            if name in names and val.strip():
+                found[names[name] if isinstance(names, dict) else name] = val.strip()
+    section = ((d.get("config") or {}).get("grove")) or {}
+    for key, name in (("control_key", "GROVE_CONTROL_KEY"), ("model_key", "GROVE_MODEL_KEY")):
+        if name not in found and str(section.get(key) or "").strip():
+            found[name] = str(section[key]).strip()
+    return installer_grove.new_keys(found, installer_grove.KEY_ENV_WORKER) if found else None
+
+
 # ------------------------------------------------------------------------------------------------------------ cli ----
+def tty_ask(question: str, default: bool = False) -> bool:
+    """A yes/no question at the terminal (only used when stdin and stdout are terminals). Enter takes the default."""
+    try:
+        answer = input("%s [%s] " % (question, "Y/n" if default else "y/N")).strip().lower()
+    except EOFError:
+        return default
+    return default if not answer else answer in ("y", "yes")
+
+
 def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]] = None,
-         out: Callable[[str], None] = print) -> int:
+         out: Callable[[str], None] = print, ask: Optional[Ask] = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m lodestone.installer", description=__doc__.split("\n\n")[0])
     ap.add_argument("--apply", action="store_true", help="really install (Linux, root); without it the plan is only printed")
     ap.add_argument("--profile", default="auto", choices=profile_choices(),
@@ -1551,6 +1686,19 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
                     help="with --docker: vulkan (AMD/Intel, Linux), cuda (NVIDIA), cpu; default: from what is found, else cpu")
     ap.add_argument("--out", default=".", help="with --docker: directory for docker-compose.yml and .env (default: here)")
     ap.add_argument("--no-stonesage", action="store_true", help="with --docker: engines, models and gateway only")
+    ap.add_argument("--with-garden", "--with-grove", dest="with_garden", action="store_true", default=None,
+                    help="add Grove, the optional agents add-on (a worker, a web reader with SearXNG, the StoneSage plugin), with the "
+                         "network walls that go with it; at a terminal you are asked when this is not given")
+    ap.add_argument("--no-garden", "--no-grove", dest="with_garden", action="store_false", help="do not add Grove, and do not ask")
+    ap.add_argument("--garden-resident", default=None, metavar="ID", help="with Grove: the first resident's id (default resident-1; created unnamed)")
+    ap.add_argument("--garden-engine-url", default=None, metavar="URL",
+                    help="with Grove: the OpenAI-compatible endpoint the residents' model is served from (default: the profile's coordinator)")
+    ap.add_argument("--garden-model", default=None, metavar="NAME", help="with Grove: a name for that model, shown on the board")
+    ap.add_argument("--garden-stonesage-url", default=None, metavar="URL",
+                    help="bare metal with Grove: where StoneSage listens, as an IP address URL (default http://127.0.0.1:8888)")
+    ap.add_argument("--apply-firewall", action="store_true",
+                    help="with Grove: apply the firewall it prepared (Docker: grove-firewall.sh; bare metal: load grove-nft.conf); "
+                         "needs root. Without this (or a yes at the prompt) the firewall is written and shown, never applied")
     ap.add_argument("--build", action=argparse.BooleanOptionalAction, default=None,
                     help="with --docker: write build sections (images made from GitHub at the release tag, no clone) instead of "
                          "pulling published images; default: on for a pre-release or unstamped tree, off for a final release")
@@ -1566,7 +1714,7 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
         return 2
     if args.docker:
         try:
-            return docker_main(args, detected, out)
+            return docker_main(args, detected, out, ask)
         except InstallerError as e:
             print("installer: %s" % e, file=sys.stderr)
             return 1
@@ -1574,7 +1722,11 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
         prefix = _safe_path("--prefix", args.prefix)
         config_path = _safe_path("--config", args.config or prefix + "/config.json")
         d = detected if detected is not None else detect(None, prefix, config_path)
-        steps = plan(d, {"profile": args.profile, "prefix": prefix, "config": config_path, "vision": args.vision})
+        garden = want_garden(args, ask)
+        gchoices: Dict[str, Any] = {}
+        if garden:
+            gchoices = dict(garden_choices(args), garden=True, apply_firewall=bool(args.apply_firewall), garden_keys=existing_grove_keys(d))
+        steps = plan(d, dict({"profile": args.profile, "prefix": prefix, "config": config_path, "vision": args.vision}, **gchoices))
         if args.json:
             out(json.dumps(steps, indent=2))
             return 0
@@ -1592,6 +1744,9 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
             out(line)
         out("DRY RUN: nothing is changed. Re-run with --apply (as root, on Linux) to install." if not args.apply else "APPLYING:")
         apply(steps, dry_run=not args.apply, out=out)
+        if garden:
+            for line in installer_grove.native_notes(RELEASE_TAG, GITHUB_ORG, bool(args.apply_firewall)):
+                out(line)
     except InstallerError as e:
         print("installer: %s" % e, file=sys.stderr)
         return 1
@@ -1599,4 +1754,4 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(ask=tty_ask if sys.stdin.isatty() and sys.stdout.isatty() else None))

@@ -75,6 +75,18 @@ class EngineLease:
         known = self.unit_roles()
         return [dict(known.get(u) or {}, unit=u) for u in units]
 
+    def layout_info(self, layout: str) -> Optional[Dict[str, Any]]:
+        """What a layout would evict, resolved against the live profile, for callers that decide before they acquire (the garden
+        scheduler): the evicted engines' roles and GPUs, and whether every one of them could be resolved."""
+        spec = self.layouts().get(layout)
+        if not spec:
+            return None
+        evicted = self._roles_of(spec.get("evicts") or [])
+        return {"layout": layout, "unit": spec.get("unit"), "url": spec.get("url"), "when": spec.get("when", "idle"),
+                "disabled": spec.get("disabled"), "roles": [e["role"] for e in evicted if e.get("role")],
+                "gpus": sorted({e["gpu"] for e in evicted if e.get("gpu")}),
+                "resolved": all(e.get("role") and e.get("gpu") for e in evicted)}
+
     # ------------------------------------------------------------------- state ----
     def _save(self) -> None:
         if not self.path:

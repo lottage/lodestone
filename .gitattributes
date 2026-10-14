@@ -13,3 +13,4 @@ Dockerfile text eol=lf
 .dockerignore text eol=lf
 docker-compose*.yml text eol=lf
 StoneSage/docker/* text eol=lf
+StoneSage/backend/grove/** text eol=lf

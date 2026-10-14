@@ -2,5 +2,5 @@
 and downloader, provenance, the engine lease and idle gate, the live system profile, and Boost (cloud brains behind
 the same API). It imports nothing from the StoneSage platform or from any app."""
 
-__version__ = "0.1.0rc4"
+__version__ = "0.1.0rc5"
 API_VERSION = "0.1"      # what the layers above are built against (lodestone/compat.py; docs/LAYERS.md 7c)

@@ -11,6 +11,7 @@ venv
 build
 dist
 tests
+_ci
 # local state and secrets: never in an image
 config.json
 **/config.json

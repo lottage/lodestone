@@ -11,7 +11,7 @@ Lodestone is layer 0 of a three-layer pyramid. Dependencies point down only: a l
 
 | Layer | Repository | Job |
 | --- | --- | --- |
-| 2 | [Hearth](https://github.com/lottage/hearth) | Apps, starting with a Home Assistant house assistant |
+| 2 | [Hearth](https://github.com/lottage/hearth), [Grove](https://github.com/lottage/grove) | Apps: a Home Assistant house assistant; an optional agents add-on |
 | 1 | [StoneSage](https://github.com/lottage/stonesage) | Agent platform: souls, tools, approvals, memory |
 | 0 | **Lodestone** (this repository) | Serves the models |
 
@@ -73,16 +73,16 @@ Docker is the way in that works the same on Linux, Windows and macOS. Python 3.1
 them (with the tools above in place):
 
 ```
-pip install "git+https://github.com/lottage/lodestone@v0.1.0-rc.4"
+pip install "git+https://github.com/lottage/lodestone@v0.1.0-rc.5"
 python -m lodestone.installer --docker          # looks at the machine, writes docker-compose.yml and .env here
 # the installer wrote your API keys into .env; start the stack (the installer prints this line with the right folder)
 docker compose up -d --build
 ```
 
-**Images.** While a release has no published images (every pre-release, such as v0.1.0-rc.4) the installer writes `build:`
+**Images.** While a release has no published images (every pre-release, such as v0.1.0-rc.5) the installer writes `build:`
 sections: Compose builds the layers' images itself from GitHub at that tag (no clone needed; the first start takes a few
 minutes longer), then downloads the models. For a release with published images the file names them by version instead
-(`ghcr.io/lottage/<layer>:0.1.0-rc.4`, never `latest`). `--build` / `--no-build` override the choice; the one command,
+(`ghcr.io/lottage/<layer>:0.1.0-rc.5`, never `latest`). `--build` / `--no-build` override the choice; the one command,
 `docker compose up -d --build`, works either way.
 
 First start, read this once: stock Ubuntu needs `docker-buildx` (Docker's own repository has it as `docker-buildx-plugin`)
@@ -92,7 +92,8 @@ of base images, then the models. `models` and `stonesage-image` are one-shot con
 as "Exited (0)" once they are done, by design; the other services should show "healthy" or "running".
 
 (`--docker` also takes `--profile auto|<rung>` (below), `--gpu auto|vulkan|cuda|cpu`, `--out DIR`, `--vision`,
-`--no-stonesage` and `--build` / `--no-build`.) What comes up:
+`--no-stonesage`, `--build` / `--no-build` and `--with-garden`, which adds [Grove](https://github.com/lottage/grove), an optional add-on
+app, with its own walled networks and a firewall script that is shown and never applied without your yes.) What comes up:
 
 - one engine container per role (coordinator, and for the bigger profiles a worker and an embedder), each running
   llama.cpp's own published server image (`ghcr.io/ggml-org/llama.cpp`, pinned to one build; change the tag in `.env`),
@@ -155,7 +156,7 @@ all for Computer's voice use, which needs answers in a few seconds. The installe
 CPU profile.
 
 `docker/` in this repository holds a ready CPU example (`docker/docker-compose.yml`, `docker/.env.example`), and the
-`Dockerfile` at the root builds the gateway image (`docker build -t ghcr.io/lottage/lodestone:0.1.0-rc.4 .`) that the Compose
+`Dockerfile` at the root builds the gateway image (`docker build -t ghcr.io/lottage/lodestone:0.1.0-rc.5 .`) that the Compose
 file uses for the gateway and the downloader.
 
 ## Install on a fresh machine without Docker (bare metal, Ubuntu 24.04)
@@ -199,8 +200,8 @@ on real hardware is still to come.
 ## Install the Python package
 
 ```
-pip install "git+https://github.com/lottage/lodestone@v0.1.0-rc.4"
-pip install --upgrade "git+https://github.com/lottage/lodestone@v0.1.0-rc.4"   # an existing install moves to this release
+pip install "git+https://github.com/lottage/lodestone@v0.1.0-rc.5"
+pip install --upgrade "git+https://github.com/lottage/lodestone@v0.1.0-rc.5"   # an existing install moves to this release
 ```
 
 From a checkout:
