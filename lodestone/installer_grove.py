@@ -27,6 +27,7 @@ WORKER_PORT = 8780
 READER_PORT = 8090
 SEARX_PORT = 8080
 STONESAGE_PORT = 8888
+SERVICE_HOST = "stonesage"                    # the cockpit's compose service name: the Host the Grove worker sends
 DEFAULT_RESIDENT = "resident-1"
 # SearXNG, pinned by tag (never latest). The Compose file reads GROVE_SEARXNG_IMAGE from .env, so changing it needs no edit of the file.
 SEARXNG_IMAGE = "docker.io/searxng/searxng:2026.9.30-a9d990033"
@@ -147,7 +148,10 @@ def add_to_compose(svc: Dict[str, Any], stack: Dict[str, Any], layer_image: Call
         "GROVE_WORKER_URL": "http://grove-worker:%d" % WORKER_PORT,
         "GROVE_ENGINE_URL": g["engine_url"], "GROVE_MODEL": g.get("model") or "", "GROVE_RESIDENT": g["resident"],
         "STONESAGE_GROVE_CONTROL_KEY": "${GROVE_CONTROL_KEY:?set GROVE_CONTROL_KEY in .env}",
-        "STONESAGE_GROVE_MODEL_KEY": "${GROVE_MODEL_KEY:?set GROVE_MODEL_KEY in .env}"})
+        "STONESAGE_GROVE_MODEL_KEY": "${GROVE_MODEL_KEY:?set GROVE_MODEL_KEY in .env}",
+        # the worker calls the cockpit as http://stonesage:<port>, and StoneSage answers 421 to any Host it does not know: the
+        # compose service name is always allowed (a literal, so a host the user lists in .env is kept after it)
+        "STONESAGE_ALLOWED_HOSTS": "%s,${STONESAGE_ALLOWED_HOSTS:-}" % SERVICE_HOST})
     st["networks"] = ["default", "grove-model"]
 
     def image_build(dockerfile: str) -> Dict[str, Any]:

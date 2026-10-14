@@ -25,6 +25,10 @@ Stand-in (DESIGN.md B2, 2026-09-28): a layout with `stand_in` (config engine_sta
   (lite mode: every action asks, short replies, it says it's on the spare brain until HH:MM). It stops only after the
   real engine answers again; if that revert fails, the stand-in keeps answering and the lease stays (revert_failed)
   until a person releases it. A stand-in that doesn't come up means Computer says "on loan" instead.
+yield_to_computer (2026-10-13): background work (the garden) leases with this flag. It honours the cockpit signal in the idle gate
+  (a person on the StoneSage page closes the gate for it; a lease a person asks for ignores that signal), and a lease that
+  evicts the coordinator while the stand-in answers can be taken back on demand (stonesage/courage/takeback.py: release, the
+  coordinator is back in ~30-50 s). brain() reports the flag; yielding() returns such a lease.
 Not built yet: hands-off / night grants and autopilot (they belong to loop jobs, which don't exist yet).
 Every step is traced as kind "lease".
 """
@@ -82,10 +86,15 @@ class EngineLease:
         if not spec:
             return None
         evicted = self._roles_of(spec.get("evicts") or [])
+        roles = [e["role"] for e in evicted if e.get("role")]
+        stand_in = spec.get("stand_in")
+        si = (self.cfg_fn().get("engine_stand_ins") or {}).get(stand_in or "") or {}
         return {"layout": layout, "unit": spec.get("unit"), "url": spec.get("url"), "when": spec.get("when", "idle"),
-                "disabled": spec.get("disabled"), "roles": [e["role"] for e in evicted if e.get("role")],
+                "disabled": spec.get("disabled"), "roles": roles,
                 "gpus": sorted({e["gpu"] for e in evicted if e.get("gpu")}),
-                "resolved": all(e.get("role") and e.get("gpu") for e in evicted)}
+                "resolved": all(e.get("role") and e.get("gpu") for e in evicted),
+                # a stand-in that replaces an engine this layout evicts AND has passed its eval (what _start_stand_in needs)
+                "stand_in": stand_in, "stand_in_ready": bool(stand_in and si.get("replaces") in roles and si.get("eval_passed"))}
 
     # ------------------------------------------------------------------- state ----
     def _save(self) -> None:
@@ -123,7 +132,8 @@ class EngineLease:
 
     # ------------------------------------------------------------------ acquire ----
     def acquire(self, layout: str, ttl_s: float = DEFAULT_TTL_S, reason: str = "", approver: str = "",
-                force: bool = False) -> Dict[str, Any]:
+                force: bool = False, yield_to_computer: bool = False) -> Dict[str, Any]:
+        """yield_to_computer: background work. The cockpit signal closes the gate for it, and Computer may take the lease back."""
         with self._lock:
             if self.lease:
                 return self._refuse(layout, f"a lease is already held ({self.lease['layout']} until "
@@ -138,8 +148,14 @@ class EngineLease:
             if spec.get("when", "idle") == "idle":
                 gate = self.idle_check()
                 gpus = {e.get("gpu") for e in evicted if e.get("gpu")}
-                closed = [f"{g}: {', '.join(gate['gpus'].get(g, {}).get('reasons') or gate.get('shared_reasons') or ['closed'])}"
-                          for g in sorted(gpus) if not (gate.get("gpus", {}).get(g) or {}).get("open")]
+                cockpit = None if yield_to_computer else gate.get("cockpit")       # a person's own lease ignores his being on the page
+                shared = [r for r in gate.get("shared_reasons") or [] if r != cockpit]
+
+                def is_open(g: Dict[str, Any]) -> bool:
+                    return bool(g.get("open_ignoring_cockpit", g.get("open"))) if cockpit else bool(g.get("open"))
+
+                closed = [f"{g}: {', '.join(gate['gpus'].get(g, {}).get('reasons') or shared or ['closed'])}"
+                          for g in sorted(gpus) if not is_open(gate.get("gpus", {}).get(g) or {})]
                 if closed or not gpus:
                     return self._refuse(layout, "idle gate closed: " + ("; ".join(closed) or "evicted engines' GPUs unknown"))
             if not force:
@@ -153,7 +169,7 @@ class EngineLease:
                      # live profile no longer lists them, and the revert must still know where to check /health
                      "evicted": evicted,
                      "approver": approver or "unknown", "started": self.clock(), "expires": self.clock() + ttl,
-                     "ttl_s": ttl, "checked_in": False, "state": "starting"}
+                     "ttl_s": ttl, "checked_in": False, "state": "starting", "yield_to_computer": bool(yield_to_computer)}
             self.lease = lease
             self._save()
         lease["stand_in"] = self._start_stand_in(spec, roles)   # before the coordinator goes: Computer never goes dark
@@ -170,7 +186,8 @@ class EngineLease:
             lease["expires"] = self.clock() + ttl          # the clock starts once it answers
             self._save()
             self._record("acquire", lease_id=lease["id"], layout=layout, evicts=lease["evicts"], ttl_s=ttl,
-                         reason=lease["reason"], approver=lease["approver"], forced=force)
+                         reason=lease["reason"], approver=lease["approver"], forced=force,
+                         yield_to_computer=bool(yield_to_computer))
             return {"ok": True, "lease_id": lease["id"], "url": lease["url"], "expires": lease["expires"],
                     "until": _hhmm(lease["expires"])}
 
@@ -200,8 +217,17 @@ class EngineLease:
             return None
         si = lease.get("stand_in") or {}
         if si.get("up") and si.get("replaces") == role:
-            return {"mode": "lite", "url": si["url"], "until": lease["expires"], "state": lease.get("state")}
-        return {"mode": "on_loan", "until": lease["expires"]}
+            return {"mode": "lite", "url": si["url"], "until": lease["expires"], "state": lease.get("state"),
+                    "yield_to_computer": bool(lease.get("yield_to_computer"))}
+        return {"mode": "on_loan", "until": lease["expires"], "yield_to_computer": bool(lease.get("yield_to_computer"))}
+
+    def yielding(self, role: str = "coordinator") -> Optional[Dict[str, Any]]:
+        """A copy of the held lease when it is background work (yield_to_computer), is starting or active, and has `role` lent
+        out; else None. What Computer may take back (stonesage/courage/takeback.py)."""
+        lease = self.lease
+        if lease and lease.get("yield_to_computer") and lease.get("state") in ("starting", "active")                 and role in (lease.get("evicted_roles") or []):
+            return dict(lease)
+        return None
 
     def _refuse(self, layout: str, why: str) -> Dict[str, Any]:
         self._record("refused", layout=layout, why=why)

@@ -159,6 +159,20 @@ class DockerStack(unittest.TestCase):
         with self.assertRaises(inst.InstallerError):
             inst.docker_files(machine(), {"gpu": "cpu", "profile": "cpu", "stonesage": False, "garden": True, "tag": TAG})
 
+    def test_the_worker_host_name_is_always_an_allowed_host(self):
+        # the worker calls http://stonesage:8888 and StoneSage answers 421 to a Host it does not know (the rc.5 dry run)
+        env = self.svc["stonesage"]["environment"]["STONESAGE_ALLOWED_HOSTS"]
+        self.assertEqual(env, "stonesage,${STONESAGE_ALLOWED_HOSTS:-}")
+        self.assertIn("STONESAGE_ALLOWED_HOSTS: stonesage,${STONESAGE_ALLOWED_HOSTS:-}", self.files["docker-compose.yml"].replace('"', ""))
+        # a host the user lists in .env comes after it, and the entrypoint drops the empty item
+        self.assertEqual(env.split(",")[0], ig.SERVICE_HOST)
+
+    def test_without_garden_the_allowed_hosts_are_what_they_were(self):
+        files, st = inst.docker_files(machine(), {"gpu": "cpu", "profile": "cpu", "stonesage": True, "tag": TAG, "build": True})
+        comp = inst.compose_dict(st)
+        self.assertEqual(comp["services"]["stonesage"]["environment"]["STONESAGE_ALLOWED_HOSTS"], "${STONESAGE_ALLOWED_HOSTS:-}")
+        self.assertNotIn("stonesage,", files["docker-compose.yml"])
+
     def test_rerunning_keeps_the_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
             first = inst.api_keys(tmp, True)

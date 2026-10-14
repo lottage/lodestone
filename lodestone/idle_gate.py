@@ -11,6 +11,10 @@ engines on it, and Computer or vision goes offline for the run. The gate is open
   Computer   no turn in the last recent_turn_min
   household  nobody awake who might want the house brain (commentary.Commentary.household: phone in use, watch
              steps, just got home or seen -> awake; home and unknown -> the house quiet for idle_min)
+  cockpit    nobody is using the StoneSage page (stonesage/activity.py: a heartbeat from the page, or any signed-in
+             request that is not a poll, within the window; default 10 min). A shared reason like the others, kept
+             separately as `cockpit` and as each GPU's `open_ignoring_cockpit`: a lease a PERSON asks for from that
+             very page must not be refused because he is on it (engine_lease.acquire); background work (the garden) is.
 
 Which engines sit on which GPU comes from the live system profile (fdinfo), never from code. No clock anywhere
 (the owner: no set sleep schedule). The gate only reports; nothing acts on it yet (the engine lease will).
@@ -27,7 +31,9 @@ class IdleGate:
     def __init__(self, cfg_fn: Callable[[], Dict[str, Any]], profile_fn: Callable[[], Dict[str, Any]],
                  prom_query: Callable[[str], List[Dict[str, Any]]], household_fn: Callable[[], Dict[str, Any]],
                  pending_fn: Callable[[], int], last_turn_fn: Callable[[], Optional[float]],
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, activity_fn: Optional[Callable[[], Optional[str]]] = None):
+        """activity_fn() -> "someone is using StoneSage (N s ago)" while a person is on the cockpit, else None."""
+        self.activity_fn = activity_fn
         self.cfg_fn, self.profile_fn, self.prom_query = cfg_fn, profile_fn, prom_query
         self.household_fn, self.pending_fn, self.last_turn_fn, self.clock = household_fn, pending_fn, last_turn_fn, clock
         self._cache: Optional[Dict[str, Any]] = None
@@ -61,6 +67,15 @@ class IdleGate:
             shared.append(f"Computer answered {round((now - last) / 60)} min ago")
         house = self.household_fn()
         shared += house.get("reasons") or []
+        cockpit = None
+        if self.activity_fn:
+            try:
+                cockpit = self.activity_fn()
+            except Exception:
+                cockpit = None
+        shared_core = list(shared)
+        if cockpit:
+            shared.append(cockpit)
         gpus = {}
         for g in self.profile_fn().get("gpus") or []:
             name, reasons = g.get("short") or g.get("name") or g.get("pci"), []
@@ -75,9 +90,9 @@ class IdleGate:
                 elif idle[eng] < 1:
                     reasons.append(f"{eng} served a request in the last 5 min")
             gpus[name] = {"open": not reasons and not shared, "engines": g.get("engines") or [],
-                          "busy_percent": b, "reasons": reasons}
+                          "busy_percent": b, "reasons": reasons, "open_ignoring_cockpit": not reasons and not shared_core}
         self._cache = {"open": any(v["open"] for v in gpus.values()), "gpus": gpus, "shared_reasons": shared,
-                       "household": house, "pending_approvals": pending, "checked_at": now}
+                       "cockpit": cockpit, "household": house, "pending_approvals": pending, "checked_at": now}
         return self._cache
 
     def metrics(self) -> List[str]:

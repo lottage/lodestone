@@ -85,5 +85,31 @@ class TestIdleGate(unittest.TestCase):
         self.assertIn("stonesage_household_quiet 1", text)
 
 
+
+class TestIdleGateCockpit(unittest.TestCase):
+    def rig(self):
+        r = Rig()
+        self.act = {"reason": None}
+        r.gate.activity_fn = lambda: self.act["reason"]
+        return r
+
+    def test_it_is_a_shared_reason_that_closes_every_gpu(self):
+        r = self.rig()
+        self.assertTrue(r.check()["open"])
+        self.act["reason"] = "someone is using StoneSage (4 s ago)"
+        c = r.check()
+        self.assertFalse(c["open"])
+        self.assertIn("someone is using StoneSage (4 s ago)", c["shared_reasons"])
+        self.assertEqual(c["cockpit"], "someone is using StoneSage (4 s ago)")
+        for g in c["gpus"].values():
+            self.assertFalse(g["open"])
+            self.assertTrue(g["open_ignoring_cockpit"])
+
+    def test_a_broken_signal_does_not_close_the_gate(self):
+        r = self.rig()
+        r.gate.activity_fn = lambda: 1 / 0
+        self.assertTrue(r.check()["open"])
+
+
 if __name__ == "__main__":
     unittest.main()
