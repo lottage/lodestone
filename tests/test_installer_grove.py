@@ -233,17 +233,19 @@ class DockerMain(unittest.TestCase):
         code = inst.main(["--docker", "--out", tmp] + list(argv), detected=machine_ or machine(), out=out.append, ask=ask)
         return code, "\n".join(out), tmp
 
-    def test_the_files_are_written_and_the_firewall_is_shown_but_not_applied(self):
+    def test_the_files_are_written_and_the_firewall_is_pointed_to_but_not_applied(self):
         code, text, tmp = self.run_main("--with-garden", "--gpu", "cpu")
         self.assertEqual(code, 0, text)
         self.assertTrue(os.path.isfile(os.path.join(tmp, "grove-firewall.sh")))
         self.assertTrue(os.path.isfile(os.path.join(tmp, "grove", "searxng-settings.yml")))
-        self.assertIn("iptables -A", text)                                            # the script is printed
+        self.assertNotIn("iptables -A", text)                                         # not dumped: the path and the commands only
+        self.assertIn("less ", text)
         self.assertIn("Not applied", text)
         self.assertIn("sudo sh", text)
         # the LAST lines are the ones people follow: the firewall step comes first, then docker compose up
         tail = text[text.rindex("Next, in this order:"):]
-        self.assertLess(tail.index("1. apply Grove's firewall"), tail.index("docker compose up"))
+        self.assertLess(tail.index("2. apply it as root"), tail.index("docker compose up"))
+        self.assertEqual(len([l for l in tail.splitlines() if l.strip()[:2] in ("1.", "2.", "3.")]), 3)
         self.assertNotIn("Next: run", text)
         if os.name == "posix":
             self.assertEqual(os.stat(os.path.join(tmp, ".env")).st_mode & 0o777, 0o600)

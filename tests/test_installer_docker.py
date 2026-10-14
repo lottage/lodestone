@@ -687,6 +687,75 @@ def docker_compose_available():
         return False
 
 
+# ------------------------------------------------------------------------------------------------------ time zone ----
+class TimezoneTests(unittest.TestCase):
+    """rc.8 dry run: the installer wrote TZ=UTC on a UTC box whatever the owner wanted. The zone now comes from the host, is asked
+    for at a terminal when it is UTC or unknown (Enter keeps it), is written to .env, and reaches the cockpit container."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="docker-tz-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def host(self, tz="", etc="", timedatectl=""):
+        return {"env": {"TZ": tz}, "read": lambda path: etc or None, "run": lambda argv: timedatectl or None}
+
+    def go(self, *argv, host=None, ask_text=None):
+        lines = []
+        code = inst.main(["--docker", "--out", self.tmp] + list(argv), detected=machine("none"), out=lines.append,
+                         ask_text=ask_text, host=host or self.host())
+        self.assertEqual(code, 0, lines)
+        return slurp(os.path.join(self.tmp, ".env")), lines
+
+    def test_host_lookup_order_and_validation(self):
+        self.assertEqual(inst.host_timezone(**self.host(tz="Europe/Paris", etc="America/Chicago")), "Europe/Paris")
+        self.assertEqual(inst.host_timezone(**self.host(etc="America/Chicago\n")), "America/Chicago")
+        self.assertEqual(inst.host_timezone(**self.host(timedatectl="Asia/Tokyo\n")), "Asia/Tokyo")
+        self.assertEqual(inst.host_timezone(**self.host(tz="not a zone; rm -rf /", etc="../../etc/passwd")), "")
+        for bad in ("", "a b", "Europe/..", "UTC\nX=1", "$(id)", "/etc/x", "A/B/C/D"):
+            self.assertFalse(inst.valid_timezone(bad), bad)
+        for good in ("UTC", "Europe/Paris", "America/Argentina/Buenos_Aires", "Etc/GMT+5"):
+            self.assertTrue(inst.valid_timezone(good), good)
+
+    def test_the_host_zone_is_written_and_reaches_the_cockpit(self):
+        env, lines = self.go(host=self.host(etc="Europe/Paris"))
+        self.assertIn("\nTZ=Europe/Paris\n", env)
+        self.assertNotIn("TZ=UTC", env)
+        self.assertTrue(any("TZ=Europe/Paris" in l and "from this computer" in l for l in lines), lines)
+        comp = load_yaml(slurp(os.path.join(self.tmp, "docker-compose.yml")))
+        self.assertEqual(comp["services"]["stonesage"]["environment"]["TZ"], "${TZ:-UTC}")      # filled from .env
+
+    def test_a_utc_host_asks_at_a_terminal_and_enter_keeps_it(self):
+        asked = []
+        env, _ = self.go(host=self.host(etc="Etc/UTC"), ask_text=lambda q, d: asked.append((q, d)) or "")
+        self.assertEqual(asked[0][1], "Etc/UTC")
+        self.assertIn("\nTZ=Etc/UTC\n", env)
+
+    def test_an_answer_is_used_and_a_bad_one_asked_again(self):
+        answers = iter(["Mars/Olympus mons", "America/Denver"])
+        env, _ = self.go(host=self.host(), ask_text=lambda q, d: next(answers))
+        self.assertIn("\nTZ=America/Denver\n", env)
+
+    def test_a_script_is_never_asked_and_unknown_means_utc(self):
+        env, lines = self.go()
+        self.assertIn("\nTZ=UTC\n", env)
+        self.assertTrue(any("none found, so UTC" in l for l in lines), lines)
+
+    def test_a_non_utc_host_is_not_asked(self):
+        def never(q, d):
+            raise AssertionError("asked: " + q)
+        env, _ = self.go(host=self.host(tz="Europe/London"), ask_text=never)
+        self.assertIn("\nTZ=Europe/London\n", env)
+
+    def test_the_flag_wins_and_is_checked(self):
+        env, _ = self.go("--timezone", "Australia/Perth", host=self.host(etc="Europe/Paris"))
+        self.assertIn("\nTZ=Australia/Perth\n", env)
+        self.assertEqual(inst.main(["--docker", "--out", self.tmp, "--timezone", "x y"], detected=machine("none"), out=lambda l: None), 1)
+
+    def test_no_stonesage_has_no_zone_line(self):
+        env, _ = self.go("--no-stonesage", host=self.host(etc="Europe/Paris"))
+        self.assertNotIn("TZ=", env)
+
+
 @unittest.skipUnless(docker_compose_available(), "docker compose is not installed here")
 class RealComposeTests(unittest.TestCase):
     def test_docker_compose_accepts_every_file(self):

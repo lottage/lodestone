@@ -51,7 +51,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from . import installer_grove
 
@@ -1156,7 +1156,7 @@ LLAMA_CPP_IMAGE_VARIANT = {"vulkan": "server-vulkan", "cuda": "server-cuda", "cp
 # the git tag of all three repositories, and the compose file names images by it (never `latest`) and builds from it. The
 # source tree carries the number of the next release; a tree built without --tag carries the placeholder, which a release
 # refuses (release_public_repos.py). Image versions drop the leading v: tag v0.1.0-rc.2 = image 0.1.0-rc.2.
-RELEASE_TAG = "v0.1.0-rc.8"
+RELEASE_TAG = "v0.1.0-rc.9"
 UNSET_TAG = "UNSET-TAG"
 GITHUB_ORG = "https://github.com/lottage"
 IMAGE_REGISTRY = "ghcr.io/lottage"
@@ -1283,7 +1283,7 @@ def docker_stack(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) ->
             raise InstallerError(str(e))
     return {"profile": profile, "gpu": kind, "roles": roles, "notes": notes + role_notes, "threads": cpu_threads(d),
             "stonesage": c.get("stonesage", True), "tag": tag, "build": default_build(tag) if build is None else bool(build),
-            "garden": garden}
+            "garden": garden, "timezone": c.get("timezone") or "UTC"}
 
 
 def _py_http_check(port: int, path: str) -> List[str]:
@@ -1496,7 +1496,9 @@ def render_env(stack: Dict[str, Any], keys: Optional[Dict[str, str]] = None) -> 
             "STONESAGE_ALLOWED_HOSTS=",
             "HASS_URL=http://homeassistant.local:8123",
             "HASS_TOKEN=",
-            "TZ=UTC",
+            "# Time zone of the cockpit's clock, greetings and schedules (a name like Europe/Paris; UTC if unsure). The installer",
+            "# took it from this computer; change it here, then `docker compose up -d` again.",
+            "TZ=%s" % (stack.get("timezone") or "UTC"),
         ]
     if kind == "vulkan":
         lines += [
@@ -1518,6 +1520,55 @@ def docker_files(d: Dict[str, Any], choices: Optional[Dict[str, Any]] = None) ->
     if stack.get("garden"):
         files.update(installer_grove.docker_files(stack, keys))
     return files, stack
+
+
+_ZONE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+){0,2}$")
+
+
+def valid_timezone(zone: Any) -> bool:
+    """An IANA zone name as `TZ` takes it ("Europe/Paris", "Europe/London", "UTC"). The name goes into a file the container
+    reads, so anything else (spaces, quotes, newlines) is refused. No tz database lookup: the installer may run on a machine
+    that has none; the container validates it."""
+    return isinstance(zone, str) and bool(_ZONE.match(zone)) and ".." not in zone
+
+
+def host_timezone(env: Optional[Mapping[str, str]] = None, read: Callable[[str], Optional[str]] = _read_text,
+                  run: Callable[[List[str]], Optional[str]] = _run_text) -> str:
+    """This computer's time zone, '' when it cannot be told: $TZ, /etc/timezone, `timedatectl`, the /etc/localtime link."""
+    env = os.environ if env is None else env
+    candidates = [str(env.get("TZ", "")).lstrip(":"), (read("/etc/timezone") or "").strip(),
+                  (run(["timedatectl", "show", "-p", "Timezone", "--value"]) or "").strip()]
+    try:
+        link = os.readlink("/etc/localtime")
+        if "zoneinfo/" in link:
+            candidates.append(link.split("zoneinfo/", 1)[1])
+    except (OSError, NotImplementedError, AttributeError):
+        pass
+    return next((c for c in candidates if valid_timezone(c)), "")
+
+
+def choose_timezone(args: argparse.Namespace, ask_text: Optional[Callable[[str, str], str]],
+                    env: Optional[Mapping[str, str]] = None, read: Callable[[str], Optional[str]] = _read_text,
+                    run: Callable[[List[str]], Optional[str]] = _run_text) -> Tuple[str, str]:
+    """(zone, where it came from). --timezone wins; else the host's zone. When that is UTC or unknown (a server often is, a
+    laptop never) a person at a terminal is asked, and Enter keeps the default; a script is not asked."""
+    given = getattr(args, "timezone", None)
+    if given:
+        if not valid_timezone(given):
+            raise InstallerError("--timezone %r is not a zone name like Europe/Paris or UTC" % given)
+        return given, "--timezone"
+    found = host_timezone(env, read, run)
+    default = found or "UTC"
+    if (not found or found.upper() in ("UTC", "ETC/UTC", "ETC/UCT", "ZULU")) and ask_text is not None:
+        while True:
+            answer = ask_text("Time zone for the cockpit's clock and schedules, as Region/City (for example Europe/Paris); "
+                              "this computer reports %s" % (found or "none"), default).strip()
+            if not answer:
+                return default, "kept"
+            if valid_timezone(answer):
+                return answer, "asked"
+            print("  not a zone name like Europe/Paris; try again, or press Enter to keep %s" % default)
+    return default, ("this computer" if found else "default")
 
 
 def write_docker_files(files: Dict[str, str], out_dir: str, stamp: str, out: Callable[[str], None] = print) -> None:
@@ -1579,21 +1630,23 @@ def firewall_flow(args: argparse.Namespace, d: Dict[str, Any], out_dir: str, out
     script = os.path.join(out_dir, installer_grove.FIREWALL_SCRIPT)
     quoted = shlex.quote(os.path.abspath(script))
     out("")
-    out("Grove's firewall: %s. It keeps the reader's network (bridge %s) away from your LAN, your router and this host. Read it:" % (
+    out("Grove's firewall: %s. It keeps the reader's network (bridge %s) away from your LAN, your router and this host." % (
         script, installer_grove.EGRESS_BRIDGE))
-    with open(script, encoding="utf-8") as f:
-        for line in f.read().splitlines():
-            out("  | " + line)
     if d.get("system") != "Linux":
         out("This is not Linux: Docker Desktop runs containers in a VM, where these iptables rules on the host do not apply. The reader "
             "still refuses private addresses itself, but the network wall is NOT in place. Prefer a Linux host for Grove.")
         return False
     yes = True if getattr(args, "apply_firewall", False) else None
     if yes is None and ask is not None:
+        out("Read it first: less %s" % quoted)
         yes = ask("Apply the firewall now? (needs root; it adds iptables rules for that one bridge only)", False)
     if not yes:
-        out("Not applied. Run it as root BEFORE `docker compose up` (the reader's network is open to your LAN until you do): sudo sh %s" % quoted)
+        out("Not applied.")          # docker_main ends with the commands, in order
         return False
+    out("Applying this script (iptables rules for that one bridge only):")
+    with open(script, encoding="utf-8") as f:
+        for line in f.read().splitlines():
+            out("  | " + line)
     euid = euid if euid is not None else (os.geteuid() if hasattr(os, "geteuid") else None)
     if euid != 0:
         out("Not applied: it needs root. Run: sudo sh %s" % quoted)
@@ -1606,12 +1659,16 @@ def firewall_flow(args: argparse.Namespace, d: Dict[str, Any], out_dir: str, out
 
 
 def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], out: Callable[[str], None],
-                ask: Optional[Ask] = None, run: Callable[..., int] = _run_cmd) -> int:
+                ask: Optional[Ask] = None, run: Callable[..., int] = _run_cmd,
+                ask_text: Optional[Callable[[str, str], str]] = None, host: Optional[Dict[str, Any]] = None) -> int:
+    """host: for tests, {"env": ..., "read": ..., "run": ...} in place of this computer's (time zone lookup)."""
     d = detected if detected is not None else detect(None, DEFAULT_PREFIX, "")
     garden = want_garden(args, ask)
+    zone, zone_from = choose_timezone(args, ask_text, **(host or {}))
     keys = api_keys(args.out, garden)
     files, stack = docker_files(d, dict({"profile": args.profile, "gpu": args.gpu, "vision": args.vision,
-                                         "stonesage": not args.no_stonesage, "keys": keys, "build": args.build, "garden": garden},
+                                         "stonesage": not args.no_stonesage, "keys": keys, "build": args.build, "garden": garden,
+                                         "timezone": zone},
                                         **garden_choices(args)))
     for line in describe(d, native=False):
         out(line)
@@ -1632,6 +1689,9 @@ def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], ou
         "The cockpit's login asks for STONESAGE_API_KEY; the gateway wants LODESTONE_API_KEY as a bearer."
         if stack["stonesage"] else "The gateway wants LODESTONE_API_KEY as a bearer.")))
     if stack["stonesage"]:
+        out("Time zone: TZ=%s (%s). Change it in .env if that is wrong, then `docker compose up -d` again." % (
+            zone, {"kept": "kept", "asked": "your answer", "default": "none found, so UTC",
+                   "this computer": "from this computer"}.get(zone_from, zone_from)))
         out("HASS_TOKEN in .env may stay empty: the setup wizard in the cockpit asks for the Home Assistant URL and token.")
     if stack["garden"]:
         g = stack["garden"]
@@ -1644,9 +1704,10 @@ def docker_main(args: argparse.Namespace, detected: Optional[Dict[str, Any]], ou
         # the last lines are the ones people follow: the wall comes first, and the order is spelled out
         script = shlex.quote(os.path.abspath(os.path.join(args.out, installer_grove.FIREWALL_SCRIPT)))
         out("Next, in this order:")
-        out("  1. apply Grove's firewall as root:  sudo sh %s" % script)
-        out("  2. then start the stack:            %s" % up)
-        out("Do not start the stack before step 1: until then the reader's network is open to your LAN.")
+        out("  1. read Grove's firewall:   less %s" % script)
+        out("  2. apply it as root:        sudo sh %s" % script)
+        out("  3. then start the stack:    %s" % up)
+        out("Do not start the stack before step 2: until then the reader's network is open to your LAN.")
     else:
         out("Next: run `%s`" % up)
     return 0
@@ -1679,8 +1740,18 @@ def tty_ask(question: str, default: bool = False) -> bool:
     return default if not answer else answer in ("y", "yes")
 
 
+def tty_text(question: str, default: str = "") -> str:
+    """A one-line question at the terminal; Enter takes the default (returned as ''), end of input too."""
+    try:
+        answer = input("%s [%s] " % (question, default)).strip()
+    except EOFError:
+        return ""
+    return "" if answer == default else answer
+
+
 def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]] = None,
-         out: Callable[[str], None] = print, ask: Optional[Ask] = None) -> int:
+         out: Callable[[str], None] = print, ask: Optional[Ask] = None,
+         ask_text: Optional[Callable[[str, str], str]] = None, host: Optional[Dict[str, Any]] = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m lodestone.installer", description=__doc__.split("\n\n")[0])
     ap.add_argument("--apply", action="store_true", help="really install (Linux, root); without it the plan is only printed")
     ap.add_argument("--profile", default="auto", choices=profile_choices(),
@@ -1695,6 +1766,9 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
                     help="with --docker: vulkan (AMD/Intel, Linux), cuda (NVIDIA), cpu; default: from what is found, else cpu")
     ap.add_argument("--out", default=".", help="with --docker: directory for docker-compose.yml and .env (default: here)")
     ap.add_argument("--no-stonesage", action="store_true", help="with --docker: engines, models and gateway only")
+    ap.add_argument("--timezone", default=None, metavar="ZONE",
+                    help="with --docker: the cockpit's time zone, as Region/City (default: this computer's; at a terminal you are asked "
+                         "when that is UTC or unknown)")
     ap.add_argument("--with-garden", "--with-grove", dest="with_garden", action="store_true", default=None,
                     help="add Grove, the optional agents add-on (a worker, a web reader with SearXNG, the StoneSage plugin), with the "
                          "network walls that go with it; at a terminal you are asked when this is not given")
@@ -1723,7 +1797,7 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
         return 2
     if args.docker:
         try:
-            return docker_main(args, detected, out, ask)
+            return docker_main(args, detected, out, ask, ask_text=ask_text, host=host)
         except InstallerError as e:
             print("installer: %s" % e, file=sys.stderr)
             return 1
@@ -1763,4 +1837,5 @@ def main(argv: Optional[List[str]] = None, *, detected: Optional[Dict[str, Any]]
 
 
 if __name__ == "__main__":
-    sys.exit(main(ask=tty_ask if sys.stdin.isatty() and sys.stdout.isatty() else None))
+    _tty = sys.stdin.isatty() and sys.stdout.isatty()
+    sys.exit(main(ask=tty_ask if _tty else None, ask_text=tty_text if _tty else None))
