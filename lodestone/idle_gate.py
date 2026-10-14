@@ -16,6 +16,15 @@ engines on it, and Computer or vision goes offline for the run. The gate is open
              separately as `cockpit` and as each GPU's `open_ignoring_cockpit`: a lease a PERSON asks for from that
              very page must not be refused because he is on it (engine_lease.acquire); background work (the garden) is.
 
+Two gates since 2026-10-14 (the owner: "no user activity = open; the garden may run for the whole movie"):
+  DEMAND gate (`demand_open`, `demand_shared_reasons`)  hardware demand only: GPU busy, engines idle, no approval waiting, no
+             Computer turn in computer_turn_min (default 2). No household, no schedule, no human presence. The garden
+             and every background lease (yield_to_computer) use this one. The cockpit signal is kept apart (`cockpit`,
+             `demand_open_with_cockpit`) because it applies to garden leases (all of which yield to Computer) but not to a lease a person asks for.
+  FULL gate (`open`, `shared_reasons`)  the demand rules with recent_turn_min plus the household signal: what a lease a person
+             asks for, and the metric, have always used. The household signal (awake/asleep/quiet) is for human-facing
+             features (commentary: whether to speak unprompted), not for lending hardware.
+
 Which engines sit on which GPU comes from the live system profile (fdinfo), never from code. No clock anywhere
 (the owner: no set sleep schedule). The gate only reports; nothing acts on it yet (the engine lease will).
 """
@@ -23,8 +32,9 @@ Which engines sit on which GPU comes from the live system profile (fdinfo), neve
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-DEFAULTS = {"busy_max": 10, "recent_turn_min": 15}
+DEFAULTS = {"busy_max": 10, "recent_turn_min": 15, "computer_turn_min": 2}
 CACHE_S = 20
+GATE_VERSION = 2          # 1 = the old rule (household signals closed the gate); 2 = hardware demand only for background work
 
 
 class IdleGate:
@@ -65,7 +75,13 @@ class IdleGate:
         last = self.last_turn_fn()
         if last and now - last < float(cfg["recent_turn_min"]) * 60:
             shared.append(f"Computer answered {round((now - last) / 60)} min ago")
-        house = self.household_fn()
+        demand_shared = [r for r in shared if not r.startswith("Computer answered")]
+        if last and now - last < float(cfg["computer_turn_min"]) * 60:
+            demand_shared.append(f"Computer answered {round((now - last) / 60)} min ago")
+        try:
+            house = self.household_fn()
+        except Exception:
+            house = {"quiet": True, "reasons": []}
         shared += house.get("reasons") or []
         cockpit = None
         if self.activity_fn:
@@ -90,9 +106,12 @@ class IdleGate:
                 elif idle[eng] < 1:
                     reasons.append(f"{eng} served a request in the last 5 min")
             gpus[name] = {"open": not reasons and not shared, "engines": g.get("engines") or [],
-                          "busy_percent": b, "reasons": reasons, "open_ignoring_cockpit": not reasons and not shared_core}
-        self._cache = {"open": any(v["open"] for v in gpus.values()), "gpus": gpus, "shared_reasons": shared,
-                       "cockpit": cockpit, "household": house, "pending_approvals": pending, "checked_at": now}
+                          "busy_percent": b, "reasons": reasons, "open_ignoring_cockpit": not reasons and not shared_core,
+                          "demand_open": not reasons and not demand_shared,
+                          "demand_open_with_cockpit": not reasons and not demand_shared and not cockpit}
+        self._cache = {"open": any(v["open"] for v in gpus.values()), "demand_open": any(v["demand_open"] for v in gpus.values()),
+                       "demand_shared_reasons": demand_shared, "gate_version": GATE_VERSION,
+                       "gpus": gpus, "shared_reasons": shared, "cockpit": cockpit, "household": house, "pending_approvals": pending, "checked_at": now}
         return self._cache
 
     def metrics(self) -> List[str]:
@@ -102,6 +121,10 @@ class IdleGate:
                  "# TYPE stonesage_idle_gate_open gauge"]
         for name, g in sorted(c["gpus"].items()):
             lines.append(f'stonesage_idle_gate_open{{gpu="{name}"}} {1 if g["open"] else 0}')
+        lines += ["# HELP stonesage_idle_gate_demand_open 1 when hardware demand alone (no household signal) would lend this GPU out.",
+                  "# TYPE stonesage_idle_gate_demand_open gauge"]
+        for name, g in sorted(c["gpus"].items()):
+            lines.append(f'stonesage_idle_gate_demand_open{{gpu="{name}"}} {1 if g["demand_open"] else 0}')
         lines += ["# HELP stonesage_household_quiet 1 when nobody seems awake who might want the house brain.",
                   "# TYPE stonesage_household_quiet gauge",
                   f"stonesage_household_quiet {1 if c['household'].get('quiet') else 0}"]

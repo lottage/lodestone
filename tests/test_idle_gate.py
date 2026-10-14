@@ -111,5 +111,66 @@ class TestIdleGateCockpit(unittest.TestCase):
         self.assertTrue(r.check()["open"])
 
 
+class TestDemandGate(unittest.TestCase):
+    """2026-10-14: background work is gated on hardware demand only; the household signal never closes it."""
+
+    def setUp(self):
+        self.r = Rig()
+        self.awake = {"quiet": False, "reasons": ["Alex is awake (using their phone)", "house active 1 min ago and Sam may be up"]}
+
+    def test_people_awake_do_not_close_the_demand_gate(self):
+        self.r.house = self.awake
+        c = self.r.check()
+        self.assertFalse(c["open"])                                     # the full gate (a lease a person asks for) is unchanged
+        self.assertTrue(c["demand_open"])
+        for g in c["gpus"].values():
+            self.assertTrue(g["demand_open"])
+        self.assertEqual(c["demand_shared_reasons"], [])
+        self.assertEqual(c["household"]["quiet"], False)                 # the signal is still reported
+
+    def test_a_computer_turn_closes_it_for_computer_turn_min_only(self):
+        self.r.last_turn = NOW - 60
+        c = self.r.check()
+        self.assertFalse(c["demand_open"])
+        self.assertIn("Computer answered 1 min ago", c["demand_shared_reasons"])
+        self.r.last_turn = NOW - 180                                      # 3 min: past the default 2
+        c = self.r.check()
+        self.assertTrue(c["demand_open"])
+        self.assertFalse(c["open"])                                       # the full gate keeps its 15 min
+
+    def test_computer_turn_min_is_configurable(self):
+        self.r.gate.cfg_fn = lambda: {"idle_gate": {"computer_turn_min": 10}}
+        self.r.last_turn = NOW - 300
+        self.assertFalse(self.r.check()["demand_open"])
+
+    def test_approval_and_hardware_close_it(self):
+        self.r.pending = 1
+        self.assertFalse(self.r.check()["demand_open"])
+        self.r = Rig()
+        self.r.busy["0000:01:00.0"] = 50
+        c = self.r.check()
+        self.assertFalse(c["gpus"]["RX 6750 XT"]["demand_open"])
+        self.assertTrue(c["gpus"]["RX 6600"]["demand_open"])
+        self.r = Rig()
+        self.r.idle["vision"] = 0                                         # the sentry used the VLM: vision's card stays shut
+        c = self.r.check()
+        self.assertFalse(c["gpus"]["RX 6600"]["demand_open"])
+        self.assertTrue(c["gpus"]["RX 6750 XT"]["demand_open"])
+
+    def test_cockpit_is_kept_apart(self):
+        self.r.gate.activity_fn = lambda: "someone is using StoneSage (4 s ago)"
+        c = self.r.check()
+        self.assertTrue(c["demand_open"])
+        for g in c["gpus"].values():
+            self.assertTrue(g["demand_open"])
+            self.assertFalse(g["demand_open_with_cockpit"])
+
+    def test_metric_lines_and_household_gauge(self):
+        self.r.house = self.awake
+        text = "\n".join(self.r.gate.metrics())
+        self.assertIn('stonesage_idle_gate_open{gpu="RX 6750 XT"} 0', text)
+        self.assertIn('stonesage_idle_gate_demand_open{gpu="RX 6750 XT"} 1', text)
+        self.assertIn("stonesage_household_quiet 0", text)
+
 if __name__ == "__main__":
     unittest.main()
